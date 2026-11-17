@@ -37,7 +37,9 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1m").strip().lower()
 ATR_LENGTH = 15
 FACTOR = 3.0
 CANDLE_LIMIT = 500
-POLL_SECONDS = 2
+# Check open maker orders each second so 3s/6s repricing steps aren't delayed
+# by the dashboard's separate 2-second refresh cadence.
+POLL_SECONDS = 1
 MAKER_TIMEOUT_SECONDS = 10
 MAKER_REPRICE_SECONDS = (3, 6)
 STOP_REQUESTED = False
