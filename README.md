@@ -7,7 +7,9 @@ This bot follows the chart settings shown: **mark-price candles**, **SuperTrend 
 - While the trend color is unchanged, it leaves the position alone.
 - Orders begin as post-only GTC limit orders at the passive best bid/ask. If still unfilled after a fixed 10 seconds, the bot cancels the maker order and sends the remaining amount as a market order. The fallback can incur taker fees. The bot tracks pending orders and changes them when the desired side changes.
 
-It uses Delta India public mark-price OHLC data for signals and Delta India futures post-only limit orders for execution. Position size is set as integer contract lots separately for BTCUSD and ETHUSD.
+It uses Delta India public mark-price OHLC data for signals and Delta India futures post-only limit orders for execution. Unfilled maker orders are repriced to the current passive best bid/ask at 3 and 6 seconds. At 10 seconds, the bot cancels the pending maker order(s) and uses a market fallback for any remaining target quantity. Position size is set as integer contract lots separately for BTCUSD and ETHUSD.
+
+On a SuperTrend reversal, the bot submits the reduce-only close limit and the new-direction entry limit in the same reconciliation cycle. Both are tracked while pending; if either reaches the 10-second timeout, the bot cancels the reversal pair before reconciling the net position at market.
 
 ## Setup on Windows PowerShell
 

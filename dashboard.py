@@ -123,7 +123,7 @@ PAGE = r'''<!doctype html>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
-      <p class="note">Unfilled post-only orders switch to market after a fixed 10 seconds, which may incur taker fees. Stop cancels pending bot orders and leaves open positions as they are.</p>
+      <p class="note">Post-only orders are repriced to the current maker-side quote at 3 and 6 seconds. If still unfilled at 10 seconds, they switch to market and may incur taker fees. Stop cancels pending bot orders and leaves open positions as they are.</p>
     </section>
     <section class="card positions-card">
       <div class="label">Current Delta positions and mark prices</div>

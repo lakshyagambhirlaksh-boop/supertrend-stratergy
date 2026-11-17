@@ -39,7 +39,9 @@ FACTOR = 3.0
 CANDLE_LIMIT = 500
 POLL_SECONDS = 2
 MAKER_TIMEOUT_SECONDS = 10
+MAKER_REPRICE_SECONDS = (3, 6)
 STOP_REQUESTED = False
+ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -252,6 +254,63 @@ def cancel_order(product_id: int, order: dict[str, Any]) -> None:
     log.info("Cancelled stale maker order %s for %s", order.get("id"), order.get("product_symbol"))
 
 
+def reprice_post_only_order(product_id: int, symbol: str, order: dict[str, Any]) -> None:
+    """Move an existing maker order to the current passive best quote."""
+    if not LIVE_TRADING:
+        return
+    side = str(order.get("side", ""))
+    order_id = order.get("id")
+    price = get_best_quote(symbol, side)
+    old_price = order.get("limit_price")
+    try:
+        if old_price is not None and float(old_price) == float(price):
+            log.info("Maker order %s already at current %s quote %s", order_id, side, price)
+            return
+    except (TypeError, ValueError):
+        if str(old_price) == str(price):
+            return
+    payload = {
+        "id": order_id,
+        "product_id": product_id,
+        "limit_price": price,
+        "size": int(order.get("size", order.get("unfilled_size", 0))),
+        "post_only": True,
+    }
+    data = signed_request("PUT", "/v2/orders", body_obj=payload)
+    result = data.get("result", data)
+    log.info("Repriced post-only order id=%s %s %s from %s to %s state=%s",
+             order_id, symbol, side, old_price, price, result.get("state"))
+
+
+def manage_pending_maker_order(
+    contract: Contract, product_id: int, direction: int, order: dict[str, Any]
+) -> None:
+    """Reprice at 3s and 6s, then use the existing market fallback at 10s."""
+    order_id = str(order.get("id") or order.get("client_order_id") or "")
+    age = order_age_seconds(order)
+    if age is None:
+        return
+    if age >= MAKER_TIMEOUT_SECONDS:
+        log.warning("%s maker order %s unfilled for %.1fs; switching remaining quantity to market",
+                    contract.symbol, order_id, age)
+        if LIVE_TRADING:
+            market_fallback_for_pending(contract, product_id, direction, order)
+        ORDER_REPRICE_ATTEMPTS.pop(order_id, None)
+        return
+
+    completed_attempts = ORDER_REPRICE_ATTEMPTS.get(order_id, 0)
+    next_attempt = completed_attempts + 1
+    if next_attempt > len(MAKER_REPRICE_SECONDS) or age < MAKER_REPRICE_SECONDS[next_attempt - 1]:
+        return
+    # Mark the attempt before calling Delta so transient edit errors do not cause
+    # repeated amend requests on every 2-second poll.
+    ORDER_REPRICE_ATTEMPTS[order_id] = next_attempt
+    try:
+        reprice_post_only_order(product_id, contract.symbol, order)
+    except Exception as exc:
+        log.warning("Could not reprice maker order %s for %s: %s", order_id, contract.symbol, exc)
+
+
 def place_post_only_limit_order(
     symbol: str, lots: int, side: str, reduce_only: bool = False
 ) -> None:
@@ -401,6 +460,13 @@ def reconcile_position(contract: Contract, product_id: int, direction: int) -> N
             log_trade_event(f"{instrument} {position_side} size changed to {abs(current)} lots while SuperTrend was {trend}")
         LAST_KNOWN_POSITIONS[contract.symbol] = current
     existing_orders = get_strategy_open_orders(product_id)
+    active_order_keys = {
+        str(order.get("id") or order.get("client_order_id") or "")
+        for order in existing_orders
+    }
+    for order_key in list(ORDER_REPRICE_ATTEMPTS):
+        if order_key not in active_order_keys:
+            ORDER_REPRICE_ATTEMPTS.pop(order_key, None)
     current_sign = 0 if current == 0 else (1 if current > 0 else -1)
 
     if current_sign and current_sign != desired_sign:
@@ -425,6 +491,8 @@ def reconcile_position(contract: Contract, product_id: int, direction: int) -> N
                         contract.symbol)
             market_fallback_for_reversal(contract, product_id, direction, reversal_orders)
             return
+        for order in reversal_orders:
+            manage_pending_maker_order(contract, product_id, direction, order)
 
         trend = "green" if direction == 1 else "red"
         instrument = contract.symbol.removesuffix("USD")
@@ -466,13 +534,7 @@ def reconcile_position(contract: Contract, product_id: int, direction: int) -> N
             cancel_order(product_id, order)
     if keep_id is not None:
         pending_order = next(order for order in matching if order.get("id") == keep_id)
-        age = order_age_seconds(pending_order)
-        if age is not None and age >= MAKER_TIMEOUT_SECONDS:
-            log.warning("%s maker order %s unfilled for %.1fs; switching remaining quantity to market",
-                        contract.symbol, keep_id, age)
-            if LIVE_TRADING:
-                market_fallback_for_pending(contract, product_id, direction, pending_order)
-            return
+        manage_pending_maker_order(contract, product_id, direction, pending_order)
         return
 
     log.info("%s SuperTrend is %s; place maker %s order %s lots=%d",
