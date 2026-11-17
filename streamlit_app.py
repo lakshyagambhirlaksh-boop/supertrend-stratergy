@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import signal
@@ -178,16 +179,26 @@ def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
     return rows, error, delta_ip, api_authenticated
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def _public_egress_ips() -> tuple[str, str]:
-    values = []
-    for url in ("https://api.ipify.org", "https://api6.ipify.org"):
-        try:
-            response = bot.SESSION.get(url, timeout=5)
-            response.raise_for_status()
-            values.append(response.text.strip() or "Unavailable")
-        except Exception:
-            values.append("Unavailable")
+    services = {
+        4: ("https://api.ipify.org", "https://checkip.amazonaws.com", "https://ipv4.icanhazip.com"),
+        6: ("https://api6.ipify.org", "https://ipv6.icanhazip.com"),
+    }
+    values: list[str] = []
+    for version in (4, 6):
+        value = "Unavailable"
+        for url in services[version]:
+            try:
+                response = bot.SESSION.get(url, timeout=3)
+                response.raise_for_status()
+                candidate = response.text.strip()
+                if ipaddress.ip_address(candidate).version == version:
+                    value = candidate
+                    break
+            except Exception:
+                continue
+        values.append(value)
     return values[0], values[1]
 
 
