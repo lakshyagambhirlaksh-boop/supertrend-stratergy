@@ -1,0 +1,479 @@
+"""Delta India SuperTrend reversal bot for BTCUSD and ETHUSD perpetuals.
+
+Signals use Delta mark-price candles and SuperTrend(15, 3) on the selected timeframe.
+The script only evaluates completed candles. Live order placement is disabled
+unless ENABLE_LIVE_TRADING=true is set in .env.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import signal
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import urlencode
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+API_BASE = os.getenv("DELTA_API_BASE", "https://api.india.delta.exchange").rstrip("/")
+API_KEY = os.getenv("DELTA_API_KEY", "").strip()
+API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
+LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").strip().lower() == "true"
+SUPPORTED_TIMEFRAMES = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+TIMEFRAME = os.getenv("TIMEFRAME", "1m").strip().lower()
+ATR_LENGTH = 15
+FACTOR = 3.0
+CANDLE_LIMIT = 500
+POLL_SECONDS = 2
+MAKER_TIMEOUT_SECONDS = 10
+STOP_REQUESTED = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("delta-supertrend")
+SESSION = requests.Session()
+SESSION.headers.update({"Accept": "application/json", "User-Agent": "delta-supertrend-python"})
+PAPER_POSITIONS: dict[str, int] = {}
+LAST_KNOWN_POSITIONS: dict[str, int] = {}
+TRADE_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+
+
+def log_trade_event(message: str) -> None:
+    event_time = datetime.now(TRADE_TIMEZONE).strftime("%H:%M:%S")
+    log.info("TRADE_EVENT|%s|%s", event_time, message)
+
+
+@dataclass(frozen=True)
+class Contract:
+    symbol: str
+    size: int
+
+
+def configured_contracts() -> list[Contract]:
+    if TIMEFRAME not in SUPPORTED_TIMEFRAMES:
+        allowed = ", ".join(SUPPORTED_TIMEFRAMES)
+        raise ValueError(f"TIMEFRAME must be one of: {allowed}")
+    all_contracts = {
+        "BTCUSD": Contract("BTCUSD", int(os.getenv("BTC_SIZE", "1"))),
+        "ETHUSD": Contract("ETHUSD", int(os.getenv("ETH_SIZE", "1"))),
+    }
+    selected_symbols = [
+        symbol.strip().upper()
+        for symbol in os.getenv("TRADE_SYMBOLS", "BTCUSD,ETHUSD").split(",")
+        if symbol.strip()
+    ]
+    if not selected_symbols or any(symbol not in all_contracts for symbol in selected_symbols):
+        raise ValueError("TRADE_SYMBOLS must be BTCUSD, ETHUSD, or BTCUSD,ETHUSD")
+    contracts = [all_contracts[symbol] for symbol in dict.fromkeys(selected_symbols)]
+    if any(contract.size <= 0 for contract in contracts):
+        raise ValueError("BTC_SIZE and ETH_SIZE must be positive integer lot sizes")
+    return contracts
+
+
+def _query_string(params: dict[str, Any] | None) -> str:
+    if not params:
+        return ""
+    return "?" + urlencode(params)
+
+
+def _auth_headers(method: str, path: str, query: str = "", body: str = "") -> dict[str, str]:
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Set DELTA_API_KEY and DELTA_API_SECRET in your .env file")
+    timestamp = str(int(time.time()))
+    prehash = method.upper() + timestamp + path + query + body
+    signature = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+    return {
+        "api-key": API_KEY,
+        "timestamp": timestamp,
+        "signature": signature,
+        "User-Agent": "delta-supertrend-python",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _check_response(response: requests.Response) -> dict[str, Any]:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            details: Any = response.json()
+        except ValueError:
+            details = response.text[:500]
+        raise RuntimeError(f"Delta HTTP {response.status_code}: {details}") from exc
+    data = response.json()
+    if not data.get("success", False):
+        raise RuntimeError(f"Delta API error: {data}")
+    return data
+
+
+def get_mark_candles(symbol: str) -> pd.DataFrame:
+    """Fetch recent Delta mark-price candles and discard the still-forming bar."""
+    now = int(time.time())
+    params = {
+        "resolution": TIMEFRAME,
+        "symbol": f"MARK:{symbol}",
+        "start": now - CANDLE_LIMIT * SUPPORTED_TIMEFRAMES[TIMEFRAME],
+        "end": now,
+    }
+    response = SESSION.get(f"{API_BASE}/v2/history/candles", params=params, timeout=15)
+    data = _check_response(response)
+    candles = data.get("result", [])
+    if not candles:
+        raise RuntimeError(f"No candle data returned for MARK:{symbol}")
+    frame = pd.DataFrame(candles)
+    frame = frame.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    # Delta timestamps candle opening time in Unix seconds. Only use bars whose
+    # full selected candle interval has elapsed, avoiding intrabar signals.
+    frame = frame[frame["time"].astype(int) + SUPPORTED_TIMEFRAMES[TIMEFRAME] <= now].copy()
+    if len(frame) < ATR_LENGTH + 2:
+        raise RuntimeError(f"Not enough completed candles for MARK:{symbol}")
+    for column in ("high", "low", "close"):
+        frame[column] = pd.to_numeric(frame[column], errors="raise")
+    return frame.reset_index(drop=True)
+
+
+def add_supertrend(frame: pd.DataFrame) -> pd.DataFrame:
+    """Calculate Wilder ATR and conventional SuperTrend bands/direction."""
+    result = frame.copy()
+    previous_close = result["close"].shift(1)
+    true_range = pd.concat(
+        [
+            result["high"] - result["low"],
+            (result["high"] - previous_close).abs(),
+            (result["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1 / ATR_LENGTH, adjust=False, min_periods=ATR_LENGTH).mean()
+    midpoint = (result["high"] + result["low"]) / 2
+    basic_upper = midpoint + FACTOR * atr
+    basic_lower = midpoint - FACTOR * atr
+
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    direction = pd.Series(index=result.index, dtype="int64")
+    supertrend = pd.Series(index=result.index, dtype="float64")
+
+    first_valid = atr.first_valid_index()
+    if first_valid is None:
+        raise RuntimeError("Could not calculate ATR")
+    direction.loc[first_valid] = 1
+    supertrend.loc[first_valid] = basic_lower.loc[first_valid]
+
+    for i in range(first_valid + 1, len(result)):
+        prior = i - 1
+        if basic_upper.iloc[i] < final_upper.iloc[prior] or result["close"].iloc[prior] > final_upper.iloc[prior]:
+            final_upper.iloc[i] = basic_upper.iloc[i]
+        else:
+            final_upper.iloc[i] = final_upper.iloc[prior]
+
+        if basic_lower.iloc[i] > final_lower.iloc[prior] or result["close"].iloc[prior] < final_lower.iloc[prior]:
+            final_lower.iloc[i] = basic_lower.iloc[i]
+        else:
+            final_lower.iloc[i] = final_lower.iloc[prior]
+
+        if direction.iloc[prior] == -1:
+            direction.iloc[i] = 1 if result["close"].iloc[i] > final_upper.iloc[i] else -1
+        else:
+            direction.iloc[i] = -1 if result["close"].iloc[i] < final_lower.iloc[i] else 1
+        supertrend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+
+    result["direction"] = direction
+    result["supertrend"] = supertrend
+    return result.dropna(subset=["direction", "supertrend"]).reset_index(drop=True)
+
+
+def signed_request(method: str, path: str, params: dict[str, Any] | None = None,
+                   body_obj: dict[str, Any] | None = None) -> dict[str, Any]:
+    query = _query_string(params)
+    body = json.dumps(body_obj, separators=(",", ":")) if body_obj is not None else ""
+    headers = _auth_headers(method, path, query, body)
+    response = SESSION.request(
+        method.upper(), f"{API_BASE}{path}", params=params,
+        data=body if body else None, headers=headers, timeout=15,
+    )
+    return _check_response(response)
+
+
+def get_position(product_id: int) -> int:
+    data = signed_request("GET", "/v2/positions", {"product_id": product_id})
+    position = data.get("result") or {}
+    return int(position.get("size", 0))
+
+
+def get_product_id(symbol: str) -> int:
+    response = SESSION.get(f"{API_BASE}/v2/products/{symbol}", timeout=15)
+    data = _check_response(response)
+    return int(data["result"]["id"])
+
+
+def get_best_quote(symbol: str, side: str) -> str:
+    response = SESSION.get(f"{API_BASE}/v2/tickers/{symbol}", timeout=10)
+    data = _check_response(response)
+    ticker = data.get("result") or {}
+    quotes = ticker.get("quotes") or {}
+    quote = quotes.get("best_bid" if side == "buy" else "best_ask")
+    if quote is None:
+        raise RuntimeError(f"Delta returned no passive quote for {symbol} {side}")
+    return str(quote)
+
+
+def get_strategy_open_orders(product_id: int) -> list[dict[str, Any]]:
+    if not LIVE_TRADING:
+        return []
+    data = signed_request("GET", "/v2/orders", {"product_ids": product_id, "states": "open,pending"})
+    orders = data.get("result", [])
+    return [order for order in orders if str(order.get("client_order_id", "")).startswith("stbot-")]
+
+
+def cancel_order(product_id: int, order: dict[str, Any]) -> None:
+    if not LIVE_TRADING:
+        return
+    signed_request("DELETE", "/v2/orders", body_obj={"id": order["id"], "product_id": product_id})
+    log.info("Cancelled stale maker order %s for %s", order.get("id"), order.get("product_symbol"))
+
+
+def place_post_only_limit_order(
+    symbol: str, lots: int, side: str, reduce_only: bool = False
+) -> None:
+    limit_price = get_best_quote(symbol, side)
+    payload = {
+        "product_symbol": symbol,
+        "size": int(lots),
+        "side": side,
+        "order_type": "limit_order",
+        "limit_price": limit_price,
+        "time_in_force": "gtc",
+        "post_only": True,
+        "reduce_only": reduce_only,
+        "client_order_id": f"stbot-{symbol}-{int(time.time())}-{uuid.uuid4().hex[:6]}",
+    }
+    if not LIVE_TRADING:
+        log.warning("PAPER MODE: would place post-only %s %s lots=%d price=%s reduce_only=%s",
+                    symbol, side, lots, limit_price, reduce_only)
+        return
+    data = signed_request("POST", "/v2/orders", body_obj=payload)
+    result = data.get("result", data)
+    log.info("Delta accepted post-only limit order id=%s %s %s lots=%d at %s state=%s",
+             result.get("id"), symbol, side, lots, limit_price, result.get("state"))
+
+
+def place_market_order(symbol: str, lots: int, side: str, reduce_only: bool = False) -> None:
+    payload = {
+        "product_symbol": symbol,
+        "size": int(lots),
+        "side": side,
+        "order_type": "market_order",
+        "reduce_only": reduce_only,
+        "client_order_id": f"stbot-{symbol}-{int(time.time())}-{uuid.uuid4().hex[:6]}",
+    }
+    if not LIVE_TRADING:
+        log.warning("PAPER MODE: would use market fallback %s %s lots=%d reduce_only=%s",
+                    symbol, side, lots, reduce_only)
+        return
+    data = signed_request("POST", "/v2/orders", body_obj=payload)
+    result = data.get("result", data)
+    log.warning("Maker timeout: Delta accepted market fallback id=%s %s %s lots=%d reduce_only=%s",
+                result.get("id"), symbol, side, lots, reduce_only)
+    instrument = symbol.removesuffix("USD")
+    trade_side = "long" if side == "buy" else "short"
+    action = f"close {('long' if side == 'sell' else 'short')}" if reduce_only else f"{trade_side} market order"
+    log_trade_event(f"{instrument} {action} order placed after the 10-second maker timeout")
+
+
+def order_age_seconds(order: dict[str, Any]) -> float | None:
+    created = order.get("created_at")
+    try:
+        timestamp = float(created)
+    except (TypeError, ValueError):
+        try:
+            timestamp = float(str(order.get("client_order_id", "")).split("-")[2])
+        except (IndexError, TypeError, ValueError):
+            return None
+    if timestamp > 1e14:  # Delta order timestamps are microseconds.
+        timestamp /= 1_000_000
+    elif timestamp > 1e11:  # tolerate millisecond timestamps
+        timestamp /= 1_000
+    return max(0.0, time.time() - timestamp)
+
+
+def market_fallback_for_pending(
+    contract: Contract, product_id: int, direction: int, order: dict[str, Any]
+) -> None:
+    """Cancel an expired maker order and market the still-needed quantity."""
+    cancel_order(product_id, order)
+    time.sleep(0.25)
+    current = get_position(product_id)
+    if bool(order.get("reduce_only")):
+        if current == 0:
+            log.info("%s position closed while cancelling maker order; no market fallback needed", contract.symbol)
+            return
+        side = "sell" if current > 0 else "buy"
+        place_market_order(contract.symbol, abs(current), side, reduce_only=True)
+        return
+
+    desired_sign = 1 if direction == 1 else -1
+    current_sign = 0 if current == 0 else (1 if current > 0 else -1)
+    if current_sign not in (0, desired_sign):
+        log.warning("%s position changed while cancelling maker order; skipping market fallback", contract.symbol)
+        return
+    remaining = contract.size - abs(current) if current_sign == desired_sign else contract.size
+    if remaining > 0:
+        side = "buy" if desired_sign == 1 else "sell"
+        place_market_order(contract.symbol, remaining, side)
+
+
+def reconcile_position(contract: Contract, product_id: int, direction: int) -> None:
+    """Match the account position to the trend using maker-only limit orders."""
+    desired_sign = 1 if direction == 1 else -1
+    current = get_position(product_id) if LIVE_TRADING else PAPER_POSITIONS.get(contract.symbol, 0)
+    previous = LAST_KNOWN_POSITIONS.setdefault(contract.symbol, current)
+    if current != previous:
+        instrument = contract.symbol.removesuffix("USD")
+        trend = "green" if direction == 1 else "red"
+        if previous == 0 and current != 0:
+            position_side = "long" if current > 0 else "short"
+            log_trade_event(f"{instrument} {position_side} opened at {abs(current)} lots because SuperTrend was {trend}")
+        elif current == 0 and previous != 0:
+            position_side = "long" if previous > 0 else "short"
+            log_trade_event(f"{instrument} {position_side} closed because SuperTrend was {trend}")
+        elif previous * current < 0:
+            position_side = "long" if current > 0 else "short"
+            log_trade_event(f"{instrument} reversed to {position_side} because SuperTrend was {trend}")
+        else:
+            position_side = "long" if current > 0 else "short"
+            log_trade_event(f"{instrument} {position_side} size changed to {abs(current)} lots while SuperTrend was {trend}")
+        LAST_KNOWN_POSITIONS[contract.symbol] = current
+    existing_orders = get_strategy_open_orders(product_id)
+    current_sign = 0 if current == 0 else (1 if current > 0 else -1)
+
+    fully_aligned = current_sign == desired_sign and abs(current) >= contract.size
+    if fully_aligned:
+        for order in existing_orders:
+            cancel_order(product_id, order)
+        return
+
+    if current:
+        side = "sell" if current > 0 else "buy"
+        lots = abs(current)
+        reduce_only = True
+        action = "close"
+    else:
+        side = "buy" if direction == 1 else "sell"
+        lots = contract.size - abs(current) if current_sign == desired_sign else contract.size
+        reduce_only = False
+        action = "open"
+
+    matching = [
+        order for order in existing_orders
+        if order.get("side") == side
+        and bool(order.get("reduce_only")) == reduce_only
+        and (reduce_only or int(order.get("unfilled_size") or order.get("size", 0)) == lots)
+    ]
+    keep_id = matching[0].get("id") if matching else None
+    for order in existing_orders:
+        if order.get("id") != keep_id:
+            cancel_order(product_id, order)
+    if keep_id is not None:
+        pending_order = next(order for order in matching if order.get("id") == keep_id)
+        age = order_age_seconds(pending_order)
+        if age is not None and age >= MAKER_TIMEOUT_SECONDS:
+            log.warning("%s maker order %s unfilled for %.1fs; switching remaining quantity to market",
+                        contract.symbol, keep_id, age)
+            if LIVE_TRADING:
+                market_fallback_for_pending(contract, product_id, direction, pending_order)
+            return
+        return
+
+    log.info("%s SuperTrend is %s; place maker %s order %s lots=%d",
+             contract.symbol, "green" if direction == 1 else "red", action, side, lots)
+    place_post_only_limit_order(contract.symbol, lots, side, reduce_only=reduce_only)
+    instrument = contract.symbol.removesuffix("USD")
+    trend = "green" if direction == 1 else "red"
+    if action == "open":
+        position_side = "long" if direction == 1 else "short"
+        log_trade_event(f"{instrument} {position_side} order pending at {lots} lots because SuperTrend was {trend}")
+    else:
+        position_side = "long" if current > 0 else "short"
+        log_trade_event(f"{instrument} {position_side} close order pending because SuperTrend was {trend}")
+    if not LIVE_TRADING:
+        PAPER_POSITIONS[contract.symbol] = 0 if reduce_only else desired_sign * contract.size
+
+
+def main() -> None:
+    global STOP_REQUESTED
+    STOP_REQUESTED = False
+    if LIVE_TRADING and (not API_KEY or not API_SECRET):
+        raise RuntimeError("Live trading requires DELTA_API_KEY and DELTA_API_SECRET in .env")
+    contracts = configured_contracts()
+    if LIVE_TRADING:
+        log.warning("LIVE TRADING ENABLED. This script can submit real futures orders.")
+    else:
+        log.info("Paper mode: no orders will be sent. Set ENABLE_LIVE_TRADING=true to enable live orders.")
+
+    # Keep one loop per instrument in a single process so each symbol is handled
+    # independently and no extra concurrent workers can submit duplicate orders.
+    product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
+    last_processed: dict[str, int] = {}
+    def request_stop(signum: int, frame: Any) -> None:
+        global STOP_REQUESTED
+        del signum, frame
+        STOP_REQUESTED = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, request_stop)
+    try:
+        while not STOP_REQUESTED:
+            for contract in contracts:
+                try:
+                    candles = add_supertrend(get_mark_candles(contract.symbol))
+                    latest = candles.iloc[-1]
+                    candle_time = int(latest["time"])
+                    # Reconcile each poll so maker-order fills and open orders are
+                    # tracked; only emit the candle summary once per completed bar.
+                    reconcile_position(contract, product_ids[contract.symbol], int(latest["direction"]))
+                    if last_processed.get(contract.symbol) != candle_time:
+                        last_processed[contract.symbol] = candle_time
+                        log.info("%s close=%s supertrend=%s -> %s", contract.symbol,
+                                 latest["close"], latest["supertrend"],
+                                 "LONG (green)" if int(latest["direction"]) == 1 else "SHORT (red)")
+                except KeyboardInterrupt:
+                    STOP_REQUESTED = True
+                    break
+                except Exception:
+                    log.exception("Problem processing %s", contract.symbol)
+                    if LIVE_TRADING:
+                        log.critical("Stopping live bot after an error; it will not retry or submit more orders")
+                        raise
+            time.sleep(POLL_SECONDS)
+    finally:
+        if LIVE_TRADING:
+            for contract in contracts:
+                try:
+                    for order in get_strategy_open_orders(product_ids[contract.symbol]):
+                        cancel_order(product_ids[contract.symbol], order)
+                except Exception:
+                    log.exception("Could not cancel pending strategy orders for %s during shutdown", contract.symbol)
+        log.info("Strategy stopped; open positions were left as-is")
+
+
+if __name__ == "__main__":
+    main()
