@@ -193,18 +193,13 @@ def run() -> None:
         label = "CONNECTED" if connected else "DISCONNECTED"
         color = "#008b69" if connected else "#b64f66"
         st.markdown(f"<div style='text-align:center;background:#fff8fc;border:1px solid #e9a6c7;border-radius:14px;padding:10px'><small>Delta API key</small><br><b style='color:{color}'>{label}</b></div>", unsafe_allow_html=True)
-    try:
-        ip_response = bot.SESSION.get("https://api.ipify.org", timeout=5)
-        ip_response.raise_for_status()
-        cloud_ip = ip_response.text.strip() or "Unavailable"
-    except Exception:
-        cloud_ip = "Unavailable - outbound IP lookup failed"
-    st.markdown(
-        f"<div style='margin:4px 0 18px;background:#fff8fc;border:1px solid #edb2ce;"
-        f"border-radius:10px;padding:10px 14px'><b>IP address to whitelist in Delta:</b> "
-        f"<code style='font-size:1.05rem'>{cloud_ip}</code></div>",
-        unsafe_allow_html=True,
-    )
+        try:
+            ip_response = bot.SESSION.get("https://api.ipify.org", timeout=5)
+            ip_response.raise_for_status()
+            cloud_ip = ip_response.text.strip() or "Unavailable"
+        except Exception:
+            cloud_ip = "Unavailable"
+        st.caption(f"Cloud IP: {cloud_ip}")
 
     left, right = st.columns([1, 1.35])
     with left:
