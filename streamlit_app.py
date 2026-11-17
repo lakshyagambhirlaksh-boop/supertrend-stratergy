@@ -166,87 +166,94 @@ def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None]:
 
 
 def run() -> None:
-    st.set_page_config(page_title="Delta SuperTrend", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Delta SuperTrend", layout="wide")
     st.markdown("""
     <style>
-    .stApp { background: #f6c7df; color: #45243a; }
+    .stApp { background: #f4c3dc; color: #62384f; }
     [data-testid="stHeader"] { background: rgba(246,199,223,.92); }
-    [data-testid="stMetric"] { background: #fff7fb; border: 1px solid #e9a6c7;
-      border-radius: 12px; padding: 14px; }
+    [data-testid="stSidebar"] { display: none; }
+    .block-container { max-width: 1220px; padding-top: 2rem; }
+    [data-testid="stVerticalBlockBorderWrapper"] { background: #fff8fc;
+      border: 1px solid #edb2ce; border-radius: 15px; padding: 18px; }
+    [data-testid="stMetric"] { background: #fff8fc; border: 0; padding: 4px; }
+    [data-testid="stMetricLabel"] { color: #83536e; }
+    [data-testid="stMetricValue"] { color: #583247; }
     div.stButton > button { background: #008b69; color: white; border: 0; font-weight: 700; }
     div.stButton > button:hover { background: #007454; color: white; }
+    div.stButton > button:disabled { background: #df9cb7; color: white; }
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("Delta SuperTrend")
-    st.caption("BTCUSD / ETHUSD perpetuals · SuperTrend length 15, factor 3 · Delta mark-price candles")
-
-    with st.sidebar:
-        st.subheader("Delta API key")
-        st.caption("Credentials are read from Streamlit Cloud → App settings → Secrets.")
-        st.write("CONNECTED" if bot.API_KEY and bot.API_SECRET else "DISCONNECTED")
-        st.caption("Cloud egress IP for Delta API whitelist")
+    title_col, api_col = st.columns([4, 1])
+    with title_col:
+        st.title("Delta SuperTrend")
+        st.caption("BTCUSD / ETHUSD perpetuals | SuperTrend length 15, factor 3 | Delta mark-price candles")
+    with api_col:
+        connected = bool(bot.API_KEY and bot.API_SECRET)
+        label = "CONNECTED" if connected else "DISCONNECTED"
+        color = "#008b69" if connected else "#b64f66"
+        st.markdown(f"<div style='text-align:center;background:#fff8fc;border:1px solid #e9a6c7;border-radius:14px;padding:10px'><small>Delta API key</small><br><b style='color:{color}'>{label}</b></div>", unsafe_allow_html=True)
         try:
             ip_response = bot.SESSION.get("https://api.ipify.org", timeout=5)
-            st.code(ip_response.text.strip())
+            cloud_ip = ip_response.text.strip()
         except Exception:
-            st.code("Unavailable")
+            cloud_ip = "Unavailable"
+        st.caption(f"Cloud IP: {cloud_ip}")
 
     left, right = st.columns([1, 1.35])
     with left:
-        st.subheader("Strategy controls")
-        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
-        segment_label = st.selectbox("Trading segment", tuple(SYMBOLS))
-        active_symbols = SYMBOLS[segment_label].split(",")
-        size_cols = st.columns(2)
-        btc_lots = size_cols[0].number_input("BTC lots", min_value=1, value=1, step=1,
-                                             disabled="BTCUSD" not in active_symbols)
-        eth_lots = size_cols[1].number_input("ETH lots", min_value=1, value=1, step=1,
-                                             disabled="ETHUSD" not in active_symbols)
-        st.info("Signals use completed candles. Maker limits switch to market after 10 seconds if unfilled.")
-        st.warning("Start submits live futures orders. Stop leaves open positions as-is.")
-        status_col, control_col = st.columns(2)
-        running = _read_pid() is not None
-        status_col.metric("Strategy status", "RUNNING" if running else "STOPPED")
-        if control_col.button("Stop strategy", disabled=not running, use_container_width=True):
-            _stop()
-            st.rerun()
-        if st.button("Start live strategy", disabled=running, use_container_width=True):
-            try:
-                _start(timeframe, SYMBOLS[segment_label], int(btc_lots), int(eth_lots))
-                st.success("Live strategy started.")
+        with st.container(border=True):
+            st.subheader("Strategy status")
+            running = _read_pid() is not None
+            state_color = "#008b69" if running else "#986078"
+            st.markdown(f"<h3 style='margin-top:0;color:{state_color}'>{'RUNNING' if running else 'STOPPED'}</h3>", unsafe_allow_html=True)
+            st.caption("Live order placement is enabled when you start the strategy.")
+            timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
+            segment_label = st.selectbox("Trading segment", tuple(SYMBOLS))
+            active_symbols = SYMBOLS[segment_label].split(",")
+            btc_lots, eth_lots = 1, 1
+            size_cols = st.columns(2)
+            if "BTCUSD" in active_symbols:
+                btc_lots = size_cols[0].number_input("BTC lots", min_value=1, value=1, step=1)
+            if "ETHUSD" in active_symbols:
+                eth_lots = size_cols[1].number_input("ETH lots", min_value=1, value=1, step=1)
+            button_cols = st.columns(2)
+            if button_cols[0].button("Start live strategy", disabled=running, use_container_width=True):
+                try:
+                    _start(timeframe, SYMBOLS[segment_label], int(btc_lots), int(eth_lots))
+                    st.success("Live strategy started.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+            if button_cols[1].button("Stop strategy", disabled=not running, use_container_width=True):
+                _stop()
                 st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+            st.caption("Unfilled maker orders switch to market after a fixed 10 seconds. Stop leaves open positions as-is.")
 
     with right:
-        st.subheader("Current Delta positions")
-        rows, error, delta_ip = _live_data()
-        if error:
-            st.error(f"Delta data unavailable: {error}")
-            if delta_ip:
-                st.caption(f"Delta-observed IP to whitelist: {delta_ip}")
-        if rows:
+        with st.container(border=True):
+            st.subheader("Current Delta positions and mark prices")
+            rows, error, delta_ip = _live_data()
+            if error:
+                st.error(f"Delta data unavailable: {error}")
+                if delta_ip:
+                    st.caption(f"Delta-observed IP to whitelist: {delta_ip}")
             for row in rows:
-                with st.container(border=True):
-                    cols = st.columns(5)
-                    cols[0].metric(row["symbol"], "LONG" if row["position"] > 0 else "SHORT" if row["position"] < 0 else "FLAT")
-                    cols[1].metric("Lots", abs(row["position"]))
-                    try:
-                        mark = f"{float(row['mark']):.2f}"
-                    except (ValueError, TypeError):
-                        mark = "—"
-                    cols[2].metric("Mark price", mark)
-                    pnl = row["pnl"]
-                    cols[3].metric("Running P&L", f"{pnl}" if pnl is not None else "—")
-                    cols[4].metric("SL", f"{row['stop']}" if row["stop"] else "Not set")
-                    pending = row["pending"]
-                    if pending:
-                        st.caption(f"Pending: {pending.get('side', '').upper()} · {pending.get('unfilled_size', pending.get('size', 0))} lots · limit {pending.get('limit_price', '—')}")
+                cols = st.columns([1.1, 1.1, 1.2, 1.4, 1])
+                cols[0].markdown(f"**{row['symbol']}**")
+                cols[1].markdown("LONG" if row["position"] > 0 else "SHORT" if row["position"] < 0 else "FLAT")
+                cols[2].caption(f"Mark price: {float(row['mark']):.2f}" if row["mark"] is not None else "Mark price: N/A")
+                pnl_text = str(row["pnl"]) if row["pnl"] is not None else "N/A"
+                cols[3].caption(f"Running P&L: {pnl_text} | SL: {row['stop'] or 'Not set'}")
+                cols[4].markdown(f"**{abs(row['position'])} lots**")
+                pending = row["pending"]
+                if pending:
+                    st.caption(f"{row['symbol']} pending: {pending.get('side', '').upper()} | {pending.get('unfilled_size', pending.get('size', 0))} lots | limit {pending.get('limit_price', 'N/A')}")
+
+    with st.container(border=True):
         st.subheader("Recent bot activity")
         st.write(_latest_activity())
 
-    # Keep prices, positions and pending orders fresh without blocking the UI.
     time.sleep(2)
     st.rerun()
 
