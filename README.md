@@ -7,7 +7,7 @@ This bot follows the chart settings shown: **mark-price candles**, **SuperTrend 
 - While the trend color is unchanged, it leaves the position alone.
 - Orders begin as post-only GTC limit orders at the passive best bid/ask. If still unfilled after a fixed 10 seconds, the bot cancels the maker order and sends the remaining amount as a market order. The fallback can incur taker fees. The bot tracks pending orders and changes them when the desired side changes.
 
-It uses Delta India public mark-price OHLC data for signals and Delta India futures post-only limit orders for execution. Unfilled maker orders are repriced to the current passive best bid/ask at 3 and 6 seconds. At 10 seconds, the bot cancels the pending maker order(s) and uses a market fallback for any remaining target quantity. Position size is set as integer contract lots separately for BTCUSD and ETHUSD. The dashboard offers 20x, 50x, and 100x leverage, defaulting to 20x. Set the same leverage in Delta first; before trading, the dashboard and bot check Delta's reported leverage for each selected contract. The bot will not place orders if the value does not match.
+It uses Delta India public mark-price OHLC data for signals and Delta India futures post-only limit orders for execution. Unfilled maker orders are repriced to the current passive best bid/ask at 3 and 6 seconds. At 10 seconds, the bot cancels the pending maker order(s) and uses a market fallback for any remaining target quantity. Position size is set as integer contract lots separately for BTCUSD and ETHUSD.
 
 On a SuperTrend reversal, the bot submits the reduce-only close limit and the new-direction entry limit in the same reconciliation cycle. Both are tracked while pending; if either reaches the 10-second timeout, the bot cancels the reversal pair before reconciling the net position at market.
 
@@ -33,11 +33,11 @@ Paper mode fetches data and prints the orders it would place; it does not send o
 
 ## Live orders
 
-Only after reviewing the code and checking paper behavior, set `ENABLE_LIVE_TRADING=true` in `.env`. Live mode reads the current position and uses a reduce-only post-only limit order to close it before opening the opposite side. If the order is still unfilled after the timeout, it falls back to a market order for the remaining quantity. It does not set leverage, a stop-loss, take-profit, or account risk limits. Set leverage in Delta and confirm it matches the dashboard selection before starting; leverage magnifies both gains and losses and can increase liquidation risk.
+Only after reviewing the code and checking paper behavior, set `ENABLE_LIVE_TRADING=true` in `.env`. Live mode reads the current position and uses a reduce-only post-only limit order to close it before opening the opposite side. If the order is still unfilled after the timeout, it falls back to a market order for the remaining quantity. It does not set a stop-loss, take-profit, or account risk limits.
 
 ## Dashboard
 
-Install requirements, then run `python .\dashboard.py` and open `http://127.0.0.1:8765`. Choose a timeframe, BTC/ETH/both segment, contract lot sizes, and a leverage selection (20x default). Set that same leverage in Delta first; the dashboard verifies it before launch. Settings are saved into `.env` and can be changed while the strategy is stopped. Start may place post-only limit orders immediately to align positions with the current closed candle. **Stop strategy** terminates the bot and leaves any open positions on Delta unchanged. The dashboard binds to localhost by default; on a VPS, use an SSH tunnel rather than exposing this unauthenticated control page to the public internet.
+Install requirements, then run `python .\dashboard.py` and open `http://127.0.0.1:8765`. Choose a timeframe, BTC/ETH/both segment, and contract lot sizes, then press **Start live strategy** to launch the bot. Settings are saved into `.env` and can be changed while the strategy is stopped. Start may place post-only limit orders immediately to align positions with the current closed candle. **Stop strategy** terminates the bot and leaves any open positions on Delta unchanged. The dashboard binds to localhost by default; on a VPS, use an SSH tunnel rather than exposing this unauthenticated control page to the public internet.
 
 The bot reconciles its position to the current completed candle when it starts, then checks for each new completed candle in the selected timeframe. Keep the process running; it does not restore order history or protect against an unexpected manual trade between checks.
 

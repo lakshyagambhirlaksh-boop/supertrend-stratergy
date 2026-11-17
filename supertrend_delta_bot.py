@@ -43,7 +43,6 @@ CANDLE_LIMIT = 500
 POLL_SECONDS = 1
 MAKER_TIMEOUT_SECONDS = 10
 MAKER_REPRICE_SECONDS = (3, 6)
-SUPPORTED_LEVERAGES = {20, 50, 100}
 PRODUCT_TICK_SIZES: dict[str, Decimal] = {}
 STOP_REQUESTED = False
 ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
@@ -242,12 +241,6 @@ def get_product_tick_size(symbol: str) -> Decimal:
             raise RuntimeError(f"Delta did not provide a tick size for {symbol}")
         PRODUCT_TICK_SIZES[symbol] = Decimal(str(tick_size))
     return PRODUCT_TICK_SIZES[symbol]
-
-
-def get_order_leverage(product_id: int) -> int:
-    """Read the leverage Delta currently reports for this product's orders."""
-    data = signed_request("GET", f"/v2/products/{product_id}/orders/leverage")
-    return int(float(data["result"]["leverage"]))
 
 
 def get_best_quote(symbol: str, side: str) -> str:
@@ -621,7 +614,7 @@ def main() -> None:
         signal.signal(signal.SIGBREAK, request_stop)
     try:
         # Startup errors keep the bot process alive but paused. It retries with
-        # a bounded delay, so a bad credential/leverage response cannot submit
+        # a bounded delay, so an API or configuration error cannot submit
         # orders, and a temporary Delta outage doesn't end the strategy.
         startup_delay = 5
         while not STOP_REQUESTED:
@@ -629,28 +622,13 @@ def main() -> None:
                 if LIVE_TRADING and (not API_KEY or not API_SECRET):
                     raise RuntimeError("Live trading requires DELTA_API_KEY and DELTA_API_SECRET in .env")
                 contracts = configured_contracts()
-                try:
-                    leverage = int(os.getenv("LEVERAGE", "20"))
-                except ValueError as exc:
-                    raise ValueError("LEVERAGE must be 20, 50, or 100") from exc
-                if leverage not in SUPPORTED_LEVERAGES:
-                    raise ValueError("LEVERAGE must be 20, 50, or 100")
                 if LIVE_TRADING:
                     log.warning("LIVE TRADING ENABLED. This script can submit real futures orders.")
                 else:
                     log.info("Paper mode: no orders will be sent. Set ENABLE_LIVE_TRADING=true to enable live orders.")
 
-                # Resolve every contract and verify leverage before trading.
+                # Resolve every contract before trading.
                 product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
-                if LIVE_TRADING:
-                    for contract in contracts:
-                        actual_leverage = get_order_leverage(product_ids[contract.symbol])
-                        if actual_leverage != leverage:
-                            raise RuntimeError(
-                                f"Selected leverage is {leverage}x for {contract.symbol}, but Delta reports "
-                                f"{actual_leverage}x. Set {leverage}x for {contract.symbol} in Delta, then retry."
-                            )
-                        log.info("Verified Delta leverage %sx for %s", actual_leverage, contract.symbol)
                 report_status("OK", "Connected; monitoring selected contracts")
                 break
             except Exception as exc:

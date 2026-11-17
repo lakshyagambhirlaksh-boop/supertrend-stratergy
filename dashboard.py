@@ -51,9 +51,6 @@ active_timeframe: str | None = None
 active_segment: str | None = None
 selected_timeframe = os.getenv("TIMEFRAME", "1m").strip().lower()
 selected_segment = os.getenv("TRADE_SYMBOLS", "BTCUSD,ETHUSD").strip().upper()
-selected_leverage = os.getenv("LEVERAGE", "20").strip()
-if selected_leverage not in {"20", "50", "100"}:
-    selected_leverage = "20"
 selected_sizes = {
     "BTC_SIZE": int(os.getenv("BTC_SIZE", "1")),
     "ETH_SIZE": int(os.getenv("ETH_SIZE", "1")),
@@ -126,8 +123,6 @@ PAGE = r'''<!doctype html>
         <select id="timeframe"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option><option>1h</option></select>
         <label for="segment" class="label">Trading segment</label><br>
         <select id="segment"><option value="BTCUSD">BTC only</option><option value="ETHUSD">ETH only</option><option value="BTCUSD,ETHUSD">Both BTC and ETH</option></select>
-        <label for="leverage" class="label">Leverage</label><br>
-        <select id="leverage"><option value="20">20x</option><option value="50">50x</option><option value="100">100x</option></select>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
           <label id="btcLotField" class="label">BTC lots<br><input id="btcSize" type="number" min="1" max="10000" step="1" value="1"></label>
           <label id="ethLotField" class="label">ETH lots<br><input id="ethSize" type="number" min="1" max="10000" step="1" value="1"></label>
@@ -135,7 +130,7 @@ PAGE = r'''<!doctype html>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
-      <p class="note">Set the same leverage in Delta before starting. On errors, the strategy stays running and retries; it pauses order placement while recovering. Stop cancels pending bot orders and leaves open positions as they are.</p>
+      <p class="note">On errors, the strategy stays running and retries; it pauses order placement while recovering. Stop cancels pending bot orders and leaves open positions as they are.</p>
     </section>
     <section class="card positions-card">
       <div class="label">Current Delta positions and mark prices</div>
@@ -172,13 +167,11 @@ async function refresh() {
     $('stop').disabled = !d.running;
     $('timeframe').disabled = d.running;
     $('segment').disabled = d.running;
-    $('leverage').disabled = d.running;
     $('btcSize').disabled = d.running;
     $('ethSize').disabled = d.running;
     if (!d.running) { $('btcSize').value = d.sizes.BTC_SIZE; $('ethSize').value = d.sizes.ETH_SIZE; }
     if (d.timeframe) $('timeframe').value = d.timeframe;
     if (d.segment) $('segment').value = d.segment;
-    if (d.leverage) $('leverage').value = String(d.leverage);
     updateLotVisibility();
     if (d.positions_error) $('positions').innerHTML = `<p class="error">Could not read Delta positions: ${escapeHtml(d.positions_error)}</p>`;
     else $('positions').innerHTML = d.positions.map(p => {
@@ -212,9 +205,8 @@ async function startBot() {
   const btcSize = Number($('btcSize').value), ethSize = Number($('ethSize').value);
   if (!Number.isInteger(btcSize) || btcSize < 1 || btcSize > 10000 || !Number.isInteger(ethSize) || ethSize < 1 || ethSize > 10000) { alert('Lot sizes must be whole numbers from 1 to 10000.'); return; }
   const sizeText = segment === 'BTCUSD' ? `BTC ${btcSize} lots` : segment === 'ETHUSD' ? `ETH ${ethSize} lots` : `BTC ${btcSize} lots and ETH ${ethSize} lots`;
-  const leverage = Number($('leverage').value);
-  if (!confirm(`Start LIVE trading on ${segment === 'BTCUSD,ETHUSD' ? 'BTC and ETH' : segment.replace('USD','')} using ${timeframe} at ${leverage}x leverage? Size: ${sizeText}. High leverage increases liquidation risk. Unfilled maker orders switch to market after a fixed 10 seconds.`)) return;
-  const r = await fetch('/api/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe,segment,btc_size:btcSize,eth_size:ethSize,leverage})});
+  if (!confirm(`Start LIVE trading on ${segment === 'BTCUSD,ETHUSD' ? 'BTC and ETH' : segment.replace('USD','')} using ${timeframe}? Size: ${sizeText}. Unfilled maker orders switch to market after a fixed 10 seconds.`)) return;
+  const r = await fetch('/api/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe,segment,btc_size:btcSize,eth_size:ethSize})});
   const d = await r.json(); if (!r.ok) alert(d.error || 'Could not start strategy.'); refresh();
 }
 async function stopBot() {
@@ -225,14 +217,13 @@ async function rememberTimeframe() {
   await saveSettings();
 }
 async function saveSettings() {
-  const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:$('segment').value,btc_size:Number($('btcSize').value),eth_size:Number($('ethSize').value),leverage:Number($('leverage').value)})});
+  const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:$('segment').value,btc_size:Number($('btcSize').value),eth_size:Number($('ethSize').value)})});
   if (!r.ok) { const d=await r.json(); alert(d.error || 'Could not save settings.'); }
 }
 $("timeframe").addEventListener('change', rememberTimeframe);
 $("segment").addEventListener('change', () => { updateLotVisibility(); saveSettings(); });
 $("btcSize").addEventListener('change', saveSettings);
 $("ethSize").addEventListener('change', saveSettings);
-$("leverage").addEventListener('change', saveSettings);
 refresh(); setInterval(refresh, 2000);
 </script>
 </body></html>'''
@@ -476,7 +467,6 @@ def status():
         "timeframe": active_timeframe if running else selected_timeframe,
         "segment": active_segment if running else selected_segment,
         "sizes": selected_sizes,
-        "leverage": selected_leverage,
         "live_enabled": LIVE_TRADING,
         "positions": positions,
         "positions_error": positions_error,
@@ -504,11 +494,10 @@ def set_timeframe():
 
 @app.post("/api/settings")
 def set_settings():
-    global selected_timeframe, selected_segment, selected_sizes, selected_leverage
+    global selected_timeframe, selected_segment, selected_sizes
     body = request.get_json(silent=True) or {}
     timeframe = str(body.get("timeframe", selected_timeframe)).lower()
     segment = str(body.get("segment", selected_segment)).upper()
-    leverage = str(body.get("leverage", selected_leverage))
     try:
         btc_size = int(body.get("btc_size", selected_sizes["BTC_SIZE"]))
         eth_size = int(body.get("eth_size", selected_sizes["ETH_SIZE"]))
@@ -518,8 +507,6 @@ def set_settings():
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
     if segment not in {"BTCUSD", "ETHUSD", "BTCUSD,ETHUSD"}:
         return jsonify(error="Choose BTC only, ETH only, or both."), 400
-    if leverage not in {"20", "50", "100"}:
-        return jsonify(error="Choose 20x, 50x, or 100x leverage."), 400
     if not (1 <= btc_size <= 10000 and 1 <= eth_size <= 10000):
         return jsonify(error="Lot sizes must be from 1 to 10000."), 400
     with state_lock:
@@ -528,27 +515,23 @@ def set_settings():
         selected_timeframe = timeframe
         selected_segment = segment
         selected_sizes = {"BTC_SIZE": btc_size, "ETH_SIZE": eth_size}
-        selected_leverage = leverage
-        persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "BTC_SIZE": str(btc_size), "ETH_SIZE": str(eth_size), "LEVERAGE": leverage})
-    return jsonify(ok=True, timeframe=timeframe, segment=segment, sizes=selected_sizes, leverage=leverage)
+        persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "BTC_SIZE": str(btc_size), "ETH_SIZE": str(eth_size)})
+    return jsonify(ok=True, timeframe=timeframe, segment=segment, sizes=selected_sizes)
 
 
 @app.post("/api/start")
 def start():
-    global bot_process, active_timeframe, active_segment, selected_timeframe, selected_segment, selected_sizes, selected_leverage, last_error
+    global bot_process, active_timeframe, active_segment, selected_timeframe, selected_segment, selected_sizes, last_error
     global strategy_requested_running, strategy_environment, restart_delay_seconds, restart_at, last_bot_launch_at
     if not LIVE_TRADING:
         return jsonify(error="Live trading is disabled. Set ENABLE_LIVE_TRADING=true in .env, then restart the dashboard."), 409
     body = request.get_json(silent=True) or {}
     timeframe = str(body.get("timeframe", "1m")).lower()
     segment = str(body.get("segment", selected_segment)).upper()
-    leverage = str(body.get("leverage", selected_leverage))
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
     if segment not in {"BTCUSD", "ETHUSD", "BTCUSD,ETHUSD"}:
         return jsonify(error="Choose BTC only, ETH only, or both."), 400
-    if leverage not in {"20", "50", "100"}:
-        return jsonify(error="Choose 20x, 50x, or 100x leverage."), 400
     try:
         btc_size = int(body.get("btc_size", selected_sizes["BTC_SIZE"]))
         eth_size = int(body.get("eth_size", selected_sizes["ETH_SIZE"]))
@@ -565,7 +548,6 @@ def start():
         env["TRADE_SYMBOLS"] = segment
         env["BTC_SIZE"] = str(btc_size)
         env["ETH_SIZE"] = str(eth_size)
-        env["LEVERAGE"] = leverage
         try:
             strategy_environment = env.copy()
             bot_process = launch_bot(strategy_environment)
@@ -578,15 +560,14 @@ def start():
             selected_timeframe = timeframe
             selected_segment = segment
             selected_sizes = {"BTC_SIZE": btc_size, "ETH_SIZE": eth_size}
-            selected_leverage = leverage
-            persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "BTC_SIZE": str(btc_size), "ETH_SIZE": str(eth_size), "LEVERAGE": leverage})
+            persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "BTC_SIZE": str(btc_size), "ETH_SIZE": str(eth_size)})
             last_error = None
         except OSError as exc:
             bot_process = None
             strategy_requested_running = False
             strategy_environment = None
             return jsonify(error=f"Could not launch strategy: {exc}"), 500
-    return jsonify(ok=True, timeframe=timeframe, leverage=leverage)
+    return jsonify(ok=True, timeframe=timeframe)
 
 
 @app.post("/api/stop")
