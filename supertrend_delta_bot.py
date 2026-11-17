@@ -595,35 +595,20 @@ def reconcile_position(contract: Contract, product_id: int, direction: int) -> N
 def main() -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = False
-    if LIVE_TRADING and (not API_KEY or not API_SECRET):
-        raise RuntimeError("Live trading requires DELTA_API_KEY and DELTA_API_SECRET in .env")
-    contracts = configured_contracts()
-    try:
-        leverage = int(os.getenv("LEVERAGE", "20"))
-    except ValueError as exc:
-        raise ValueError("LEVERAGE must be 20, 50, or 100") from exc
-    if leverage not in SUPPORTED_LEVERAGES:
-        raise ValueError("LEVERAGE must be 20, 50, or 100")
-    if LIVE_TRADING:
-        log.warning("LIVE TRADING ENABLED. This script can submit real futures orders.")
-    else:
-        log.info("Paper mode: no orders will be sent. Set ENABLE_LIVE_TRADING=true to enable live orders.")
-
-    # Keep one loop per instrument in a single process so each symbol is handled
-    # independently and no extra concurrent workers can submit duplicate orders.
-    product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
-    if LIVE_TRADING:
-        for contract in contracts:
-            actual_leverage = get_order_leverage(product_ids[contract.symbol])
-            if actual_leverage != leverage:
-                raise RuntimeError(
-                    f"Selected leverage is {leverage}x for {contract.symbol}, but Delta reports "
-                    f"{actual_leverage}x. Set {leverage}x for {contract.symbol} in Delta, then start again."
-                )
-            log.info("Verified Delta leverage %sx for %s", actual_leverage, contract.symbol)
+    contracts: list[Contract] = []
+    product_ids: dict[str, int] = {}
     last_processed: dict[str, int] = {}
     retry_after: dict[str, float] = {}
     retry_delay: dict[str, int] = {}
+
+    def wait_or_stop(seconds: int) -> None:
+        deadline = time.monotonic() + seconds
+        while not STOP_REQUESTED and time.monotonic() < deadline:
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+
+    def report_status(status: str, message: str) -> None:
+        log.info("BOT_STATUS|%s|%s", status, message.replace("|", "/").replace("\n", " ")[:240])
+
     def request_stop(signum: int, frame: Any) -> None:
         global STOP_REQUESTED
         del signum, frame
@@ -635,6 +620,46 @@ def main() -> None:
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, request_stop)
     try:
+        # Startup errors keep the bot process alive but paused. It retries with
+        # a bounded delay, so a bad credential/leverage response cannot submit
+        # orders, and a temporary Delta outage doesn't end the strategy.
+        startup_delay = 5
+        while not STOP_REQUESTED:
+            try:
+                if LIVE_TRADING and (not API_KEY or not API_SECRET):
+                    raise RuntimeError("Live trading requires DELTA_API_KEY and DELTA_API_SECRET in .env")
+                contracts = configured_contracts()
+                try:
+                    leverage = int(os.getenv("LEVERAGE", "20"))
+                except ValueError as exc:
+                    raise ValueError("LEVERAGE must be 20, 50, or 100") from exc
+                if leverage not in SUPPORTED_LEVERAGES:
+                    raise ValueError("LEVERAGE must be 20, 50, or 100")
+                if LIVE_TRADING:
+                    log.warning("LIVE TRADING ENABLED. This script can submit real futures orders.")
+                else:
+                    log.info("Paper mode: no orders will be sent. Set ENABLE_LIVE_TRADING=true to enable live orders.")
+
+                # Resolve every contract and verify leverage before trading.
+                product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
+                if LIVE_TRADING:
+                    for contract in contracts:
+                        actual_leverage = get_order_leverage(product_ids[contract.symbol])
+                        if actual_leverage != leverage:
+                            raise RuntimeError(
+                                f"Selected leverage is {leverage}x for {contract.symbol}, but Delta reports "
+                                f"{actual_leverage}x. Set {leverage}x for {contract.symbol} in Delta, then retry."
+                            )
+                        log.info("Verified Delta leverage %sx for %s", actual_leverage, contract.symbol)
+                report_status("OK", "Connected; monitoring selected contracts")
+                break
+            except Exception as exc:
+                log.exception("Strategy startup problem; keeping process alive")
+                report_status("RETRYING", str(exc))
+                log.warning("Strategy remains active but paused; retrying startup in %d seconds", startup_delay)
+                wait_or_stop(startup_delay)
+                startup_delay = min(startup_delay * 2, 60)
+
         while not STOP_REQUESTED:
             for contract in contracts:
                 if time.monotonic() < retry_after.get(contract.symbol, 0):
@@ -646,8 +671,11 @@ def main() -> None:
                     # Reconcile each poll so maker-order fills and open orders are
                     # tracked; only emit the candle summary once per completed bar.
                     reconcile_position(contract, product_ids[contract.symbol], int(latest["direction"]))
+                    had_error = contract.symbol in retry_delay
                     retry_delay.pop(contract.symbol, None)
                     retry_after.pop(contract.symbol, None)
+                    if had_error:
+                        report_status("OK", f"Recovered; monitoring {contract.symbol}")
                     if last_processed.get(contract.symbol) != candle_time:
                         last_processed[contract.symbol] = candle_time
                         log.info("%s close=%s supertrend=%s -> %s", contract.symbol,
@@ -658,21 +686,11 @@ def main() -> None:
                     break
                 except Exception as exc:
                     log.exception("Problem processing %s", contract.symbol)
-                    message = str(exc).lower()
-                    transient_delta = any(code in message for code in (
-                        "delta http 429", "delta http 500", "delta http 502",
-                        "delta http 503", "delta http 504", "immediate_execution_post_only",
-                    ))
-                    transient_network = isinstance(exc, requests.RequestException) or any(
-                        phrase in message for phrase in ("timed out", "connection reset", "connection aborted", "temporary failure")
-                    )
-                    if LIVE_TRADING and not (transient_delta or transient_network):
-                        log.critical("Stopping live bot after a non-retryable exchange or strategy error")
-                        raise
                     delay = min(retry_delay.get(contract.symbol, 1) * 2, 60)
                     retry_delay[contract.symbol] = delay
                     retry_after[contract.symbol] = time.monotonic() + delay
-                    log.warning("Keeping strategy running; retrying %s in %d seconds", contract.symbol, delay)
+                    report_status("RETRYING", f"{contract.symbol}: {exc}")
+                    log.warning("Keeping strategy process running; retrying %s in %d seconds", contract.symbol, delay)
             time.sleep(POLL_SECONDS)
     finally:
         if LIVE_TRADING:
@@ -682,6 +700,7 @@ def main() -> None:
                         cancel_order(product_ids[contract.symbol], order)
                 except Exception:
                     log.exception("Could not cancel pending strategy orders for %s during shutdown", contract.symbol)
+        report_status("STOPPED", "Stopped by request; open positions were left as-is")
         log.info("Strategy stopped; open positions were left as-is")
 
 

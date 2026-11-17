@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import signal
+import logging
 import subprocess
 import sys
 import threading
@@ -26,7 +27,6 @@ from supertrend_delta_bot import (  # noqa: E402
     SUPPORTED_TIMEFRAMES,
     add_supertrend,
     get_mark_candles,
-    get_order_leverage,
     get_position,
     get_product_id,
     signed_request,
@@ -39,8 +39,14 @@ HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8765"))
 
 app = Flask(__name__)
+log = logging.getLogger("delta-supertrend-dashboard")
 state_lock = threading.Lock()
 bot_process: subprocess.Popen[str] | None = None
+strategy_requested_running = False
+strategy_environment: dict[str, str] | None = None
+restart_delay_seconds = 5
+restart_at = 0.0
+last_bot_launch_at = 0.0
 active_timeframe: str | None = None
 active_segment: str | None = None
 selected_timeframe = os.getenv("TIMEFRAME", "1m").strip().lower()
@@ -129,7 +135,7 @@ PAGE = r'''<!doctype html>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
-      <p class="note">Set the same leverage in Delta before starting; the bot checks it before placing orders. Post-only orders are repriced at 3 and 6 seconds, then switch to market after 10 seconds if unfilled.</p>
+      <p class="note">Set the same leverage in Delta before starting. On errors, the strategy stays running and retries; it pauses order placement while recovering. Stop cancels pending bot orders and leaves open positions as they are.</p>
     </section>
     <section class="card positions-card">
       <div class="label">Current Delta positions and mark prices</div>
@@ -155,9 +161,12 @@ async function refresh() {
   refreshing = true;
   try {
     const r = await fetch('/api/status'); const d = await r.json();
-    $('status').textContent = d.running ? `RUNNING · ${d.timeframe}` : 'STOPPED';
+    const healthSuffix = d.bot_health === 'RETRYING' ? ' · RETRYING' : d.bot_health === 'RESTARTING' ? ' · RESTARTING' : ` · ${d.timeframe}`;
+    $('status').textContent = d.running ? `RUNNING${healthSuffix}` : 'STOPPED';
     $('status').className = `state ${d.running ? 'on' : 'off'}`;
-    $('live').textContent = d.live_enabled ? 'Live order placement is enabled.' : 'Live order placement is disabled in .env.';
+    $('live').textContent = d.running && (d.bot_health === 'RETRYING' || d.bot_health === 'RESTARTING')
+      ? `Bot remains active and will retry; trading is paused during recovery: ${d.bot_message || 'retrying'}`
+      : d.live_enabled ? 'Live order placement is enabled.' : 'Live order placement is disabled in .env.';
     $('live').className = `note ${d.live_enabled ? 'error' : ''}`;
     $('start').disabled = d.running || !d.live_enabled;
     $('stop').disabled = !d.running;
@@ -231,6 +240,66 @@ refresh(); setInterval(refresh, 2000);
 
 def process_is_running() -> bool:
     return bot_process is not None and bot_process.poll() is None
+
+
+def read_bot_status() -> tuple[str, str]:
+    if not LOG_PATH.exists():
+        return "STARTING", "Waiting for the bot process."
+    try:
+        for line in reversed(LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()):
+            marker = "BOT_STATUS|"
+            if marker in line:
+                parts = line.split(marker, 1)[1].split("|", 1)
+                if len(parts) == 2:
+                    return parts[0], parts[1]
+    except OSError as exc:
+        return "RETRYING", f"Could not read bot status: {exc}"
+    return "STARTING", "Waiting for the bot process."
+
+
+def launch_bot(environment: dict[str, str]) -> subprocess.Popen[str]:
+    with LOG_PATH.open("a", encoding="utf-8") as log_file:
+        return subprocess.Popen(
+            [sys.executable, "-u", str(BOT_PATH)],
+            cwd=str(ROOT),
+            env=environment,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+
+
+def bot_watchdog() -> None:
+    """Restart an unexpectedly exited bot until the dashboard Stop button is used."""
+    global bot_process, restart_delay_seconds, restart_at, last_bot_launch_at, last_error
+    while True:
+        time.sleep(1)
+        with state_lock:
+            if not strategy_requested_running:
+                continue
+            now = time.monotonic()
+            if process_is_running():
+                continue
+            if bot_process is not None:
+                exit_code = bot_process.returncode
+                runtime = now - last_bot_launch_at
+                bot_process = None
+                restart_delay_seconds = 5 if runtime >= 60 else min(max(restart_delay_seconds * 2, 5), 60)
+                restart_at = now + restart_delay_seconds
+                last_error = f"Bot process exited with code {exit_code}; restarting automatically."
+                log.error("%s Next restart in %d seconds.", last_error, restart_delay_seconds)
+            if strategy_environment is None or now < restart_at:
+                continue
+            try:
+                bot_process = launch_bot(strategy_environment)
+                last_bot_launch_at = now
+                restart_at = 0.0
+                log.warning("Restarted strategy process automatically; requested running state remains on.")
+            except OSError as exc:
+                last_error = f"Could not restart bot process: {exc}"
+                restart_delay_seconds = min(max(restart_delay_seconds * 2, 5), 60)
+                restart_at = now + restart_delay_seconds
+                log.exception("%s Retrying in %d seconds.", last_error, restart_delay_seconds)
 
 
 def read_recent_activity() -> str:
@@ -317,14 +386,19 @@ def index():
 
 @app.get("/api/status")
 def status():
-    global bot_process, active_timeframe, active_segment, last_error
+    global last_error
     with state_lock:
-        running = process_is_running()
-        if bot_process is not None and not running:
-            code = bot_process.returncode
-            bot_process = None
-            if code:
-                last_error = f"Strategy process exited with code {code}; check recent activity."
+        process_alive = process_is_running()
+        running = strategy_requested_running or process_alive
+        bot_health, bot_message = read_bot_status()
+        if running and not process_alive:
+            bot_health = "RESTARTING"
+            bot_message = last_error or "Bot process exited; waiting for automatic restart."
+        elif running and bot_health == "STOPPED":
+            bot_health = "STARTING"
+            bot_message = "Starting the strategy process."
+        if running and bot_health == "OK":
+            last_error = None
 
     positions: list[dict[str, Any]] = []
     positions_error = None
@@ -396,6 +470,9 @@ def status():
 
     return jsonify({
         "running": running,
+        "process_alive": process_alive,
+        "bot_health": bot_health,
+        "bot_message": bot_message,
         "timeframe": active_timeframe if running else selected_timeframe,
         "segment": active_segment if running else selected_segment,
         "sizes": selected_sizes,
@@ -419,7 +496,7 @@ def set_timeframe():
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
     with state_lock:
-        if process_is_running():
+        if strategy_requested_running or process_is_running():
             return jsonify(error="Stop the strategy before changing timeframe."), 409
         selected_timeframe = timeframe
     return jsonify(ok=True, timeframe=timeframe)
@@ -446,7 +523,7 @@ def set_settings():
     if not (1 <= btc_size <= 10000 and 1 <= eth_size <= 10000):
         return jsonify(error="Lot sizes must be from 1 to 10000."), 400
     with state_lock:
-        if process_is_running():
+        if strategy_requested_running or process_is_running():
             return jsonify(error="Stop the strategy before changing settings."), 409
         selected_timeframe = timeframe
         selected_segment = segment
@@ -459,10 +536,9 @@ def set_settings():
 @app.post("/api/start")
 def start():
     global bot_process, active_timeframe, active_segment, selected_timeframe, selected_segment, selected_sizes, selected_leverage, last_error
+    global strategy_requested_running, strategy_environment, restart_delay_seconds, restart_at, last_bot_launch_at
     if not LIVE_TRADING:
         return jsonify(error="Live trading is disabled. Set ENABLE_LIVE_TRADING=true in .env, then restart the dashboard."), 409
-    if not API_KEY or not API_SECRET:
-        return jsonify(error="Delta API key and secret are required in .env."), 400
     body = request.get_json(silent=True) or {}
     timeframe = str(body.get("timeframe", "1m")).lower()
     segment = str(body.get("segment", selected_segment)).upper()
@@ -474,24 +550,6 @@ def start():
     if leverage not in {"20", "50", "100"}:
         return jsonify(error="Choose 20x, 50x, or 100x leverage."), 400
     try:
-        product_ids = {symbol: get_product_id(symbol) for symbol in segment.split(",")}
-        actual_leverages = {
-            symbol: get_order_leverage(product_id)
-            for symbol, product_id in product_ids.items()
-        }
-    except Exception as exc:
-        return jsonify(error=f"Could not verify Delta leverage; no strategy was started: {exc}"), 502
-    mismatches = [
-        f"{symbol} is {actual}x"
-        for symbol, actual in actual_leverages.items()
-        if actual != int(leverage)
-    ]
-    if mismatches:
-        return jsonify(error=(
-            f"Delta reports {', '.join(mismatches)}. Set {leverage}x in Delta for the selected "
-            "contract(s), then start again. No orders were placed."
-        )), 409
-    try:
         btc_size = int(body.get("btc_size", selected_sizes["BTC_SIZE"]))
         eth_size = int(body.get("eth_size", selected_sizes["ETH_SIZE"]))
     except (TypeError, ValueError):
@@ -500,7 +558,7 @@ def start():
         return jsonify(error="Lot sizes must be from 1 to 10000."), 400
 
     with state_lock:
-        if process_is_running():
+        if strategy_requested_running or process_is_running():
             return jsonify(error="Strategy is already running."), 409
         env = os.environ.copy()
         env["TIMEFRAME"] = timeframe
@@ -509,15 +567,12 @@ def start():
         env["ETH_SIZE"] = str(eth_size)
         env["LEVERAGE"] = leverage
         try:
-            with LOG_PATH.open("a", encoding="utf-8") as log_file:
-                bot_process = subprocess.Popen(
-                    [sys.executable, "-u", str(BOT_PATH)],
-                    cwd=str(ROOT),
-                    env=env,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                )
+            strategy_environment = env.copy()
+            bot_process = launch_bot(strategy_environment)
+            strategy_requested_running = True
+            restart_delay_seconds = 5
+            restart_at = 0.0
+            last_bot_launch_at = time.monotonic()
             active_timeframe = timeframe
             active_segment = segment
             selected_timeframe = timeframe
@@ -528,6 +583,8 @@ def start():
             last_error = None
         except OSError as exc:
             bot_process = None
+            strategy_requested_running = False
+            strategy_environment = None
             return jsonify(error=f"Could not launch strategy: {exc}"), 500
     return jsonify(ok=True, timeframe=timeframe, leverage=leverage)
 
@@ -535,10 +592,18 @@ def start():
 @app.post("/api/stop")
 def stop():
     global bot_process, active_timeframe, active_segment, last_error
+    global strategy_requested_running, strategy_environment, restart_at
     with state_lock:
+        was_requested = strategy_requested_running
+        strategy_requested_running = False
+        strategy_environment = None
+        restart_at = 0.0
         if not process_is_running():
             bot_process = None
-            return jsonify(ok=True, stopped=False)
+            active_timeframe = None
+            active_segment = None
+            last_error = None
+            return jsonify(ok=True, stopped=was_requested)
         assert bot_process is not None
         if os.name == "nt":
             bot_process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -558,4 +623,5 @@ def stop():
 
 if __name__ == "__main__":
     print(f"Dashboard listening locally at http://{HOST}:{PORT}")
+    threading.Thread(target=bot_watchdog, name="strategy-watchdog", daemon=True).start()
     app.run(host=HOST, port=PORT, debug=False, threaded=True, use_reloader=False)

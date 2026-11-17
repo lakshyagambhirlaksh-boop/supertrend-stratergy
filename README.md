@@ -41,6 +41,8 @@ Install requirements, then run `python .\dashboard.py` and open `http://127.0.0.
 
 The bot reconciles its position to the current completed candle when it starts, then checks for each new completed candle in the selected timeframe. Keep the process running; it does not restore order history or protect against an unexpected manual trade between checks.
 
+The dashboard keeps the strategy requested as running until **Stop strategy** is pressed. The bot retries startup and runtime errors with a bounded delay, and the dashboard restarts the child process if it exits unexpectedly. During recovery it pauses its own order actions and shows the latest error; it does not guarantee trading continues while Delta or the API is unavailable.
+
 ## Streamlit Cloud deployment
 
 Set the Streamlit Cloud app's **Main file path** to `streamlit_app.py` (the previous `supertrend_delta_bot.py` entry is also routed to the UI to avoid the signal-handler crash). Add the credentials under **App settings → Secrets**, using TOML:
