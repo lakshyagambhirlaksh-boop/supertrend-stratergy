@@ -16,6 +16,7 @@ import signal
 import sys
 import time
 import uuid
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -43,6 +44,7 @@ POLL_SECONDS = 1
 MAKER_TIMEOUT_SECONDS = 10
 MAKER_REPRICE_SECONDS = (3, 6)
 SUPPORTED_LEVERAGES = {20, 50, 100}
+PRODUCT_TICK_SIZES: dict[str, Decimal] = {}
 STOP_REQUESTED = False
 ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
 
@@ -231,6 +233,17 @@ def get_product_id(symbol: str) -> int:
     return int(data["result"]["id"])
 
 
+def get_product_tick_size(symbol: str) -> Decimal:
+    if symbol not in PRODUCT_TICK_SIZES:
+        response = SESSION.get(f"{API_BASE}/v2/products/{symbol}", timeout=15)
+        data = _check_response(response)
+        tick_size = (data.get("result") or {}).get("tick_size")
+        if not tick_size:
+            raise RuntimeError(f"Delta did not provide a tick size for {symbol}")
+        PRODUCT_TICK_SIZES[symbol] = Decimal(str(tick_size))
+    return PRODUCT_TICK_SIZES[symbol]
+
+
 def set_order_leverage(product_id: int, leverage: int) -> None:
     """Set Delta's order leverage for this contract before placing new orders."""
     if leverage not in SUPPORTED_LEVERAGES:
@@ -238,7 +251,8 @@ def set_order_leverage(product_id: int, leverage: int) -> None:
     signed_request(
         "POST",
         f"/v2/products/{product_id}/orders/leverage",
-        body_obj={"leverage": leverage},
+        # Delta documents leverage as a string in the request schema.
+        body_obj={"leverage": str(leverage)},
     )
     log.info("Set Delta order leverage to %sx for product %s", leverage, product_id)
 
@@ -345,10 +359,28 @@ def place_post_only_limit_order(
         log.warning("PAPER MODE: would place post-only %s %s lots=%d price=%s reduce_only=%s",
                     symbol, side, lots, limit_price, reduce_only)
         return
-    data = signed_request("POST", "/v2/orders", body_obj=payload)
-    result = data.get("result", data)
-    log.info("Delta accepted post-only limit order id=%s %s %s lots=%d at %s state=%s",
-             result.get("id"), symbol, side, lots, limit_price, result.get("state"))
+    for attempt in range(4):
+        payload["limit_price"] = limit_price
+        try:
+            data = signed_request("POST", "/v2/orders", body_obj=payload)
+            result = data.get("result", data)
+            log.info("Delta accepted post-only limit order id=%s %s %s lots=%d at %s state=%s",
+                     result.get("id"), symbol, side, lots, limit_price, result.get("state"))
+            return
+        except RuntimeError as exc:
+            if "immediate_execution_post_only" not in str(exc) or attempt == 3:
+                raise
+            tick = get_product_tick_size(symbol)
+            quote = Decimal(get_best_quote(symbol, side))
+            # Move one valid tick farther from the market before retrying.
+            price_ticks = quote / tick
+            if side == "buy":
+                price_ticks = price_ticks.to_integral_value(rounding=ROUND_FLOOR) - 1
+            else:
+                price_ticks = price_ticks.to_integral_value(rounding=ROUND_CEILING) + 1
+            limit_price = format(price_ticks * tick, "f")
+            log.warning("Delta rejected a marketable post-only %s for %s; retrying farther from the market at %s (attempt %d/3)",
+                        side, symbol, limit_price, attempt + 1)
 
 
 def place_market_order(symbol: str, lots: int, side: str, reduce_only: bool = False) -> None:
@@ -591,6 +623,8 @@ def main() -> None:
         for contract in contracts:
             set_order_leverage(product_ids[contract.symbol], leverage)
     last_processed: dict[str, int] = {}
+    retry_after: dict[str, float] = {}
+    retry_delay: dict[str, int] = {}
     def request_stop(signum: int, frame: Any) -> None:
         global STOP_REQUESTED
         del signum, frame
@@ -604,6 +638,8 @@ def main() -> None:
     try:
         while not STOP_REQUESTED:
             for contract in contracts:
+                if time.monotonic() < retry_after.get(contract.symbol, 0):
+                    continue
                 try:
                     candles = add_supertrend(get_mark_candles(contract.symbol))
                     latest = candles.iloc[-1]
@@ -611,6 +647,8 @@ def main() -> None:
                     # Reconcile each poll so maker-order fills and open orders are
                     # tracked; only emit the candle summary once per completed bar.
                     reconcile_position(contract, product_ids[contract.symbol], int(latest["direction"]))
+                    retry_delay.pop(contract.symbol, None)
+                    retry_after.pop(contract.symbol, None)
                     if last_processed.get(contract.symbol) != candle_time:
                         last_processed[contract.symbol] = candle_time
                         log.info("%s close=%s supertrend=%s -> %s", contract.symbol,
@@ -619,11 +657,23 @@ def main() -> None:
                 except KeyboardInterrupt:
                     STOP_REQUESTED = True
                     break
-                except Exception:
+                except Exception as exc:
                     log.exception("Problem processing %s", contract.symbol)
-                    if LIVE_TRADING:
-                        log.critical("Stopping live bot after an error; it will not retry or submit more orders")
+                    message = str(exc).lower()
+                    transient_delta = any(code in message for code in (
+                        "delta http 429", "delta http 500", "delta http 502",
+                        "delta http 503", "delta http 504", "immediate_execution_post_only",
+                    ))
+                    transient_network = isinstance(exc, requests.RequestException) or any(
+                        phrase in message for phrase in ("timed out", "connection reset", "connection aborted", "temporary failure")
+                    )
+                    if LIVE_TRADING and not (transient_delta or transient_network):
+                        log.critical("Stopping live bot after a non-retryable exchange or strategy error")
                         raise
+                    delay = min(retry_delay.get(contract.symbol, 1) * 2, 60)
+                    retry_delay[contract.symbol] = delay
+                    retry_after[contract.symbol] = time.monotonic() + delay
+                    log.warning("Keeping strategy running; retrying %s in %d seconds", contract.symbol, delay)
             time.sleep(POLL_SECONDS)
     finally:
         if LIVE_TRADING:
