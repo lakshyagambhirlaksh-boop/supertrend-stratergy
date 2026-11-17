@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from dotenv import load_dotenv
 
+load_dotenv()
 
 ROOT = Path(__file__).resolve().parent
 BOT_PATH = ROOT / "supertrend_delta_bot.py"
@@ -33,7 +35,12 @@ def _load_secrets_into_environment() -> None:
         "DELTA_API_BASE": "DELTA_API_BASE",
     }
     for env_name, secret_name in mapping.items():
-        value = secrets.get(secret_name)
+        try:
+            value = secrets.get(secret_name)
+        except Exception:
+            # Locally, Streamlit may not have a secrets.toml; load_dotenv above
+            # already populated values from the ignored .env file.
+            value = None
         if value:
             os.environ[env_name] = str(value)
     # Cloud deployment is explicitly live-capable; the bot itself still starts
