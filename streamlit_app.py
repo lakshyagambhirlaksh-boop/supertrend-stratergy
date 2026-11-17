@@ -225,13 +225,18 @@ def run() -> None:
         else:
             label, color = "API ERROR", "#b64f66"
         st.markdown(f"<div style='text-align:center;background:#fff8fc;border:1px solid #e9a6c7;border-radius:14px;padding:10px'><small>Delta API key</small><br><b style='color:{color}'>{label}</b></div>", unsafe_allow_html=True)
-    with st.container(border=True):
-        st.subheader("IP addresses for Delta whitelist")
-        ip4_col, ip6_col = st.columns(2)
-        ip4_col.metric("IPv4 address", public_ipv4)
-        ip6_col.metric("IPv6 address", public_ipv6)
-        if delta_ip:
-            st.warning(f"Delta-reported request IP (whitelist this exact address): {delta_ip}")
+    delta_ip_note = (
+        f"<span><b>Delta saw:</b> <code>{delta_ip}</code></span>"
+        if delta_ip else ""
+    )
+    st.markdown(
+        "<div style='margin:5px 0 15px;background:#fff8fc;border:1px solid #edb2ce;"
+        "border-radius:10px;padding:8px 12px;display:flex;flex-wrap:wrap;gap:8px 22px;"
+        "align-items:center;font-size:.9rem'>"
+        f"<b>Whitelist IPs</b><span>IPv4: <code>{public_ipv4}</code></span>"
+        f"<span>IPv6: <code>{public_ipv6}</code></span>{delta_ip_note}</div>",
+        unsafe_allow_html=True,
+    )
     if SECRETS_CONFIG_ERROR and (not bot.API_KEY or not bot.API_SECRET):
         st.warning(SECRETS_CONFIG_ERROR)
 
