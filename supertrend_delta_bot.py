@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -476,4 +477,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Streamlit Cloud may still be configured with this file as its entry point.
+    # Route that invocation to the UI; the UI starts this file again as a plain
+    # Python child process when the user presses Start.
+    if "streamlit" in sys.modules:
+        from streamlit_app import run
+
+        run()
+    else:
+        main()

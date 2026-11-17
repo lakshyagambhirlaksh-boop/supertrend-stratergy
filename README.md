@@ -38,3 +38,15 @@ Only after reviewing the code and checking paper behavior, set `ENABLE_LIVE_TRAD
 Install requirements, then run `python .\dashboard.py` and open `http://127.0.0.1:8765`. Choose a timeframe, BTC/ETH/both segment, and BTC/ETH contract lot sizes, then press **Start live strategy** to launch the bot. Settings are saved into `.env` and can be changed while the strategy is stopped. Start may place post-only limit orders immediately to align positions with the current closed candle. **Stop strategy** terminates the bot and leaves any open positions on Delta unchanged. The dashboard binds to localhost by default; on a VPS, use an SSH tunnel rather than exposing this unauthenticated control page to the public internet.
 
 The bot reconciles its position to the current completed candle when it starts, then checks for each new completed candle in the selected timeframe. Keep the process running; it does not restore order history or protect against an unexpected manual trade between checks.
+
+## Streamlit Cloud deployment
+
+Set the Streamlit Cloud app's **Main file path** to `streamlit_app.py` (the previous `supertrend_delta_bot.py` entry is also routed to the UI to avoid the signal-handler crash). Add the credentials under **App settings → Secrets**, using TOML:
+
+```toml
+DELTA_API_KEY = "your-key"
+DELTA_API_SECRET = "your-secret"
+DELTA_API_BASE = "https://api.india.delta.exchange"
+```
+
+The Streamlit page starts live trading only when **Start live strategy** is clicked. Delta API keys must allow the Streamlit app's outbound IP; the dashboard shows the IP and reports Delta's observed IP when the exchange includes it in an API error. Never commit credentials to GitHub.
