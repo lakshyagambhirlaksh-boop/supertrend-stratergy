@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -21,10 +22,12 @@ PID_PATH = Path("/tmp/delta_supertrend_bot.pid")
 LOG_PATH = Path("/tmp/delta_supertrend_bot.log")
 TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h")
 SYMBOLS = {"BTC only": "BTCUSD", "ETH only": "ETHUSD", "BTC + ETH": "BTCUSD,ETHUSD"}
+SECRETS_CONFIG_ERROR: str | None = None
 
 
 def _load_secrets_into_environment() -> None:
     """Accept Streamlit Cloud secrets, while still supporting a local .env."""
+    global SECRETS_CONFIG_ERROR
     try:
         secrets = st.secrets
     except Exception:
@@ -38,8 +41,8 @@ def _load_secrets_into_environment() -> None:
         try:
             value = secrets.get(secret_name)
         except Exception:
-            # Locally, Streamlit may not have a secrets.toml; load_dotenv above
-            # already populated values from the ignored .env file.
+            # Do not expose secret values or parser details in the dashboard.
+            SECRETS_CONFIG_ERROR = "Streamlit Secrets could not be read. Check TOML syntax and put each value on the same line as its name."
             value = None
         if value:
             os.environ[env_name] = str(value)
@@ -119,12 +122,13 @@ def _latest_activity() -> str:
     return "No trade action yet."
 
 
-def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None]:
+def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
     rows: list[dict[str, Any]] = []
     error: str | None = None
     delta_ip: str | None = None
+    api_authenticated = False
     if not bot.API_KEY or not bot.API_SECRET:
-        return rows, "Add Delta API credentials to Streamlit app secrets.", None
+        return rows, "Add Delta API credentials to Streamlit app secrets.", None, False
     try:
         products = {symbol: bot.get_product_id(symbol) for symbol in ("BTCUSD", "ETHUSD")}
         margined: dict[str, dict[str, Any]] = {}
@@ -137,6 +141,7 @@ def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None]:
             pass
         for symbol, product_id in products.items():
             position = bot.get_position(product_id)
+            api_authenticated = True
             ticker_response = bot.SESSION.get(f"{bot.API_BASE}/v2/tickers/{symbol}", timeout=8)
             ticker_response.raise_for_status()
             ticker_data = ticker_response.json()
@@ -163,13 +168,27 @@ def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None]:
     except Exception as exc:
         error = str(exc)
         # Delta sometimes returns its observed egress IP in the API error.
-        marker = "client_ip"
-        if marker in error:
-            try:
-                delta_ip = error.split(marker, 1)[1].split(":", 1)[1].split(",", 1)[0].strip(" '\"}]")
-            except (IndexError, ValueError):
-                pass
-    return rows, error, delta_ip
+        client_ip_match = re.search(r"['\"]client_ip['\"]\s*:\s*['\"]([^'\"]+)", error)
+        if client_ip_match:
+            delta_ip = client_ip_match.group(1)
+        else:
+            plain_ip_match = re.search(r"Your IP:\s*([0-9a-fA-F:.]+)", error)
+            if plain_ip_match:
+                delta_ip = plain_ip_match.group(1)
+    return rows, error, delta_ip, api_authenticated
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _public_egress_ips() -> tuple[str, str]:
+    values = []
+    for url in ("https://api.ipify.org", "https://api6.ipify.org"):
+        try:
+            response = bot.SESSION.get(url, timeout=5)
+            response.raise_for_status()
+            values.append(response.text.strip() or "Unavailable")
+        except Exception:
+            values.append("Unavailable")
+    return values[0], values[1]
 
 
 def run() -> None:
@@ -191,22 +210,27 @@ def run() -> None:
     </style>
     """, unsafe_allow_html=True)
 
+    rows, error, delta_ip, api_authenticated = _live_data()
+    public_ipv4, public_ipv6 = _public_egress_ips()
+
     title_col, api_col = st.columns([4, 1])
     with title_col:
         st.title("Delta SuperTrend")
         st.caption("BTCUSD / ETHUSD perpetuals | SuperTrend length 15, factor 3 | Delta mark-price candles")
     with api_col:
-        connected = bool(bot.API_KEY and bot.API_SECRET)
-        label = "CONNECTED" if connected else "DISCONNECTED"
-        color = "#008b69" if connected else "#b64f66"
+        if api_authenticated:
+            label, color = "CONNECTED", "#008b69"
+        elif not bot.API_KEY or not bot.API_SECRET:
+            label, color = "DISCONNECTED", "#b64f66"
+        else:
+            label, color = "API ERROR", "#b64f66"
         st.markdown(f"<div style='text-align:center;background:#fff8fc;border:1px solid #e9a6c7;border-radius:14px;padding:10px'><small>Delta API key</small><br><b style='color:{color}'>{label}</b></div>", unsafe_allow_html=True)
-        try:
-            ip_response = bot.SESSION.get("https://api.ipify.org", timeout=5)
-            ip_response.raise_for_status()
-            cloud_ip = ip_response.text.strip() or "Unavailable"
-        except Exception:
-            cloud_ip = "Unavailable"
-        st.caption(f"Cloud IP: {cloud_ip}")
+    if delta_ip:
+        st.caption(f"Delta-reported request IP (whitelist this exact address): {delta_ip}")
+    else:
+        st.caption(f"App egress IPs | IPv4: {public_ipv4} | IPv6: {public_ipv6}")
+    if SECRETS_CONFIG_ERROR and (not bot.API_KEY or not bot.API_SECRET):
+        st.warning(SECRETS_CONFIG_ERROR)
 
     left, right = st.columns([1, 1.35])
     with left:
@@ -241,11 +265,8 @@ def run() -> None:
     with right:
         with st.container(border=True):
             st.subheader("Current Delta positions and mark prices")
-            rows, error, delta_ip = _live_data()
             if error:
                 st.error(f"Delta data unavailable: {error}")
-                if delta_ip:
-                    st.caption(f"Delta-observed IP to whitelist: {delta_ip}")
             for row in rows:
                 cols = st.columns([1.1, 1.1, 1.2, 1.4, 1])
                 cols[0].markdown(f"**{row['symbol']}**")
