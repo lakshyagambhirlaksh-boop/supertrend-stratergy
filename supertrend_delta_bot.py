@@ -342,8 +342,45 @@ def market_fallback_for_pending(
         place_market_order(contract.symbol, remaining, side)
 
 
+def market_fallback_for_reversal(
+    contract: Contract, product_id: int, direction: int, orders: list[dict[str, Any]]
+) -> None:
+    """Cancel both reversal limits, then safely reconcile the net position at market."""
+    for order in orders:
+        try:
+            cancel_order(product_id, order)
+        except Exception:
+            log.exception("Could not cancel reversal order %s for %s", order.get("id"), contract.symbol)
+    time.sleep(0.25)
+    remaining_orders = get_strategy_open_orders(product_id)
+    if remaining_orders:
+        log.warning("%s reversal fallback deferred because strategy orders remain open", contract.symbol)
+        return
+
+    desired_sign = 1 if direction == 1 else -1
+    current = get_position(product_id)
+    current_sign = 0 if current == 0 else (1 if current > 0 else -1)
+    if current_sign not in (0, desired_sign):
+        close_side = "sell" if current > 0 else "buy"
+        place_market_order(contract.symbol, abs(current), close_side, reduce_only=True)
+        time.sleep(0.5)
+        current = get_position(product_id)
+        current_sign = 0 if current == 0 else (1 if current > 0 else -1)
+
+    if current_sign == desired_sign:
+        remaining_lots = max(0, contract.size - abs(current))
+    elif current == 0:
+        remaining_lots = contract.size
+    else:
+        log.error("%s reversal fallback could not flatten the opposing position; leaving it unchanged", contract.symbol)
+        return
+    if remaining_lots:
+        open_side = "buy" if desired_sign == 1 else "sell"
+        place_market_order(contract.symbol, remaining_lots, open_side)
+
+
 def reconcile_position(contract: Contract, product_id: int, direction: int) -> None:
-    """Match the account position to the trend using maker-only limit orders."""
+    """Reconcile positions; submit close/open limits together on a trend reversal."""
     desired_sign = 1 if direction == 1 else -1
     current = get_position(product_id) if LIVE_TRADING else PAPER_POSITIONS.get(contract.symbol, 0)
     previous = LAST_KNOWN_POSITIONS.setdefault(contract.symbol, current)
@@ -366,22 +403,56 @@ def reconcile_position(contract: Contract, product_id: int, direction: int) -> N
     existing_orders = get_strategy_open_orders(product_id)
     current_sign = 0 if current == 0 else (1 if current > 0 else -1)
 
+    if current_sign and current_sign != desired_sign:
+        close_side = "sell" if current > 0 else "buy"
+        open_side = "buy" if desired_sign == 1 else "sell"
+        close_order = next((order for order in existing_orders
+                            if order.get("side") == close_side and bool(order.get("reduce_only"))), None)
+        open_order = next((order for order in existing_orders
+                           if order.get("side") == open_side and not bool(order.get("reduce_only"))), None)
+        keep_ids = {
+            order.get("id") for order in (close_order, open_order) if order is not None
+        }
+        for order in existing_orders:
+            if order.get("id") not in keep_ids:
+                cancel_order(product_id, order)
+
+        reversal_orders = [order for order in (close_order, open_order) if order is not None]
+        expired = [order for order in reversal_orders
+                   if (order_age_seconds(order) or 0) >= MAKER_TIMEOUT_SECONDS]
+        if expired and LIVE_TRADING:
+            log.warning("%s reversal maker order timed out; cancelling the pair before market reconciliation",
+                        contract.symbol)
+            market_fallback_for_reversal(contract, product_id, direction, reversal_orders)
+            return
+
+        trend = "green" if direction == 1 else "red"
+        instrument = contract.symbol.removesuffix("USD")
+        if close_order is None:
+            log.info("%s SuperTrend is %s; place reduce-only close limit %s lots=%d",
+                     contract.symbol, trend, close_side, abs(current))
+            place_post_only_limit_order(contract.symbol, abs(current), close_side, reduce_only=True)
+            log_trade_event(f"{instrument} close order pending because SuperTrend turned {trend}")
+        if open_order is None:
+            log.info("%s SuperTrend is %s; place new-side open limit %s lots=%d at the same time as close",
+                     contract.symbol, trend, open_side, contract.size)
+            place_post_only_limit_order(contract.symbol, contract.size, open_side, reduce_only=False)
+            position_side = "long" if desired_sign == 1 else "short"
+            log_trade_event(f"{instrument} {position_side} order pending alongside close because SuperTrend turned {trend}")
+        if not LIVE_TRADING:
+            PAPER_POSITIONS[contract.symbol] = desired_sign * contract.size
+        return
+
     fully_aligned = current_sign == desired_sign and abs(current) >= contract.size
     if fully_aligned:
         for order in existing_orders:
             cancel_order(product_id, order)
         return
 
-    if current:
-        side = "sell" if current > 0 else "buy"
-        lots = abs(current)
-        reduce_only = True
-        action = "close"
-    else:
-        side = "buy" if direction == 1 else "sell"
-        lots = contract.size - abs(current) if current_sign == desired_sign else contract.size
-        reduce_only = False
-        action = "open"
+    side = "buy" if desired_sign == 1 else "sell"
+    lots = contract.size - abs(current) if current_sign == desired_sign else contract.size
+    reduce_only = False
+    action = "open"
 
     matching = [
         order for order in existing_orders
