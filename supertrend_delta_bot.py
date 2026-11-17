@@ -42,6 +42,7 @@ CANDLE_LIMIT = 500
 POLL_SECONDS = 1
 MAKER_TIMEOUT_SECONDS = 10
 MAKER_REPRICE_SECONDS = (3, 6)
+SUPPORTED_LEVERAGES = {20, 50, 100}
 STOP_REQUESTED = False
 ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
 
@@ -228,6 +229,18 @@ def get_product_id(symbol: str) -> int:
     response = SESSION.get(f"{API_BASE}/v2/products/{symbol}", timeout=15)
     data = _check_response(response)
     return int(data["result"]["id"])
+
+
+def set_order_leverage(product_id: int, leverage: int) -> None:
+    """Set Delta's order leverage for this contract before placing new orders."""
+    if leverage not in SUPPORTED_LEVERAGES:
+        raise ValueError("LEVERAGE must be 20, 50, or 100")
+    signed_request(
+        "POST",
+        f"/v2/products/{product_id}/orders/leverage",
+        body_obj={"leverage": leverage},
+    )
+    log.info("Set Delta order leverage to %sx for product %s", leverage, product_id)
 
 
 def get_best_quote(symbol: str, side: str) -> str:
@@ -560,6 +573,12 @@ def main() -> None:
     if LIVE_TRADING and (not API_KEY or not API_SECRET):
         raise RuntimeError("Live trading requires DELTA_API_KEY and DELTA_API_SECRET in .env")
     contracts = configured_contracts()
+    try:
+        leverage = int(os.getenv("LEVERAGE", "20"))
+    except ValueError as exc:
+        raise ValueError("LEVERAGE must be 20, 50, or 100") from exc
+    if leverage not in SUPPORTED_LEVERAGES:
+        raise ValueError("LEVERAGE must be 20, 50, or 100")
     if LIVE_TRADING:
         log.warning("LIVE TRADING ENABLED. This script can submit real futures orders.")
     else:
@@ -568,6 +587,9 @@ def main() -> None:
     # Keep one loop per instrument in a single process so each symbol is handled
     # independently and no extra concurrent workers can submit duplicate orders.
     product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
+    if LIVE_TRADING:
+        for contract in contracts:
+            set_order_leverage(product_ids[contract.symbol], leverage)
     last_processed: dict[str, int] = {}
     def request_stop(signum: int, frame: Any) -> None:
         global STOP_REQUESTED
