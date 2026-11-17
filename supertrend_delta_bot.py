@@ -122,13 +122,16 @@ def _check_response(response: requests.Response) -> dict[str, Any]:
     return data
 
 
-def get_mark_candles(symbol: str) -> pd.DataFrame:
+def get_mark_candles(symbol: str, timeframe: str | None = None) -> pd.DataFrame:
     """Fetch recent Delta mark-price candles and discard the still-forming bar."""
+    timeframe = (timeframe or TIMEFRAME).strip().lower()
+    if timeframe not in SUPPORTED_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
     now = int(time.time())
     params = {
-        "resolution": TIMEFRAME,
+        "resolution": timeframe,
         "symbol": f"MARK:{symbol}",
-        "start": now - CANDLE_LIMIT * SUPPORTED_TIMEFRAMES[TIMEFRAME],
+        "start": now - CANDLE_LIMIT * SUPPORTED_TIMEFRAMES[timeframe],
         "end": now,
     }
     response = SESSION.get(f"{API_BASE}/v2/history/candles", params=params, timeout=15)
@@ -140,7 +143,7 @@ def get_mark_candles(symbol: str) -> pd.DataFrame:
     frame = frame.sort_values("time").drop_duplicates("time").reset_index(drop=True)
     # Delta timestamps candle opening time in Unix seconds. Only use bars whose
     # full selected candle interval has elapsed, avoiding intrabar signals.
-    frame = frame[frame["time"].astype(int) + SUPPORTED_TIMEFRAMES[TIMEFRAME] <= now].copy()
+    frame = frame[frame["time"].astype(int) + SUPPORTED_TIMEFRAMES[timeframe] <= now].copy()
     if len(frame) < ATR_LENGTH + 2:
         raise RuntimeError(f"Not enough completed candles for MARK:{symbol}")
     for column in ("high", "low", "close"):

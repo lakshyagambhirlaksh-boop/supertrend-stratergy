@@ -24,6 +24,8 @@ from supertrend_delta_bot import (  # noqa: E402
     API_BASE,
     LIVE_TRADING,
     SUPPORTED_TIMEFRAMES,
+    add_supertrend,
+    get_mark_candles,
     get_position,
     get_product_id,
     signed_request,
@@ -49,6 +51,26 @@ selected_sizes = {
 last_error: str | None = None
 ip_cache: dict[str, Any] = {"address": None, "checked_at": 0.0, "error": None}
 ip_lock = threading.Lock()
+supertrend_cache_lock = threading.Lock()
+supertrend_cache: dict[tuple[str, str], tuple[int, float, int]] = {}
+
+
+def get_supertrend_reference(symbol: str, timeframe: str) -> tuple[float, int]:
+    """Return the latest completed SuperTrend level, cached for the current bar."""
+    seconds = SUPPORTED_TIMEFRAMES[timeframe]
+    bar = int(time.time()) // seconds
+    key = (symbol, timeframe)
+    with supertrend_cache_lock:
+        cached = supertrend_cache.get(key)
+        if cached and cached[0] == bar:
+            return cached[1], cached[2]
+    frame = add_supertrend(get_mark_candles(symbol, timeframe))
+    latest = frame.iloc[-1]
+    value = float(latest["supertrend"])
+    direction = int(latest["direction"])
+    with supertrend_cache_lock:
+        supertrend_cache[key] = (bar, value, direction)
+    return value, direction
 
 
 PAGE = r'''<!doctype html>
@@ -146,8 +168,9 @@ async function refresh() {
       const pending = p.pending_order;
       const pendingText = pending ? `<small class="pending-order">ORDER PENDING · ${escapeHtml(pending.side.toUpperCase())} ${pending.remaining_lots} lots @ ${formatPrice(pending.limit_price)}</small>` : '';
       const pnlText = p.size ? formatPnl(p.unrealized_pnl) : 'N/A';
-      const stopText = p.stop_loss === 'unavailable' ? 'unavailable' : p.stop_loss ? `${formatPrice(p.stop_loss)} USD` : 'Not set';
-      return `<div class="trade-row"><span class="position-main"><b>${p.symbol}</b><small class="market-price">Mark price: ${p.mark_price ? formatPrice(p.mark_price) + ' USD' : 'unavailable'}</small><small class="risk-detail">Running P&amp;L: ${pnlText} | SL: ${stopText}</small>${pendingText}</span><span class="chip ${p.size > 0 ? 'long' : p.size < 0 ? 'short' : 'flat'}">${p.size > 0 ? 'LONG' : p.size < 0 ? 'SHORT' : 'FLAT'} · ${Math.abs(p.size)} lots</span></div>`;
+      const supertrendStop = p.size ? `${formatPrice(p.supertrend_sl)} USD (${p.supertrend_direction === 1 ? 'green' : 'red'})` : 'Not active (flat)';
+      const exchangeStop = p.stop_loss === 'unavailable' ? 'unavailable' : p.stop_loss ? `${formatPrice(p.stop_loss)} USD` : 'Not set';
+      return `<div class="trade-row"><span class="position-main"><b>${p.symbol}</b><small class="market-price">Mark price: ${p.mark_price ? formatPrice(p.mark_price) + ' USD' : 'unavailable'}</small><small class="risk-detail">Running P&amp;L: ${pnlText} | SL (SuperTrend): ${supertrendStop} | Exchange SL: ${exchangeStop}</small>${pendingText}</span><span class="chip ${p.size > 0 ? 'long' : p.size < 0 ? 'short' : 'flat'}">${p.size > 0 ? 'LONG' : p.size < 0 ? 'SHORT' : 'FLAT'} · ${Math.abs(p.size)} lots</span></div>`;
     }).join('');
     $('apiConnection').textContent = d.positions_error ? 'DISCONNECTED' : 'CONNECTED';
     $('apiConnection').className = `connection-value ${d.positions_error ? 'error' : 'on'}`;
@@ -295,6 +318,7 @@ def status():
 
     positions: list[dict[str, Any]] = []
     positions_error = None
+    strategy_timeframe = active_timeframe if running and active_timeframe else selected_timeframe
     if API_KEY and API_SECRET:
         try:
             symbols = ("BTCUSD", "ETHUSD")
@@ -306,6 +330,13 @@ def status():
             for symbol in symbols:
                 product_id = product_ids[symbol]
                 position_size = get_position(product_id)
+                supertrend_sl = None
+                supertrend_direction = None
+                if position_size:
+                    try:
+                        supertrend_sl, supertrend_direction = get_supertrend_reference(symbol, strategy_timeframe)
+                    except Exception:
+                        log.exception("Could not read SuperTrend stop reference for %s", symbol)
                 try:
                     mark_price = get_mark_price(symbol)
                 except Exception:
@@ -335,7 +366,9 @@ def status():
                 positions.append({"symbol": symbol, "size": position_size,
                                   "mark_price": mark_price, "pending_order": pending_order,
                                   "unrealized_pnl": margin_position.get("unrealized_pnl"),
-                                  "stop_loss": stop_loss})
+                                  "stop_loss": stop_loss,
+                                  "supertrend_sl": supertrend_sl,
+                                  "supertrend_direction": supertrend_direction})
         except Exception as exc:
             positions_error = str(exc)
     else:
