@@ -26,6 +26,7 @@ from supertrend_delta_bot import (  # noqa: E402
     SUPPORTED_TIMEFRAMES,
     add_supertrend,
     get_mark_candles,
+    get_order_leverage,
     get_position,
     get_product_id,
     signed_request,
@@ -128,7 +129,7 @@ PAGE = r'''<!doctype html>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
-      <p class="note">Post-only orders are repriced to the current maker-side quote at 3 and 6 seconds. If still unfilled at 10 seconds, they switch to market and may incur taker fees. Stop cancels pending bot orders and leaves open positions as they are.</p>
+      <p class="note">Set the same leverage in Delta before starting; the bot checks it before placing orders. Post-only orders are repriced at 3 and 6 seconds, then switch to market after 10 seconds if unfilled.</p>
     </section>
     <section class="card positions-card">
       <div class="label">Current Delta positions and mark prices</div>
@@ -472,6 +473,24 @@ def start():
         return jsonify(error="Choose BTC only, ETH only, or both."), 400
     if leverage not in {"20", "50", "100"}:
         return jsonify(error="Choose 20x, 50x, or 100x leverage."), 400
+    try:
+        product_ids = {symbol: get_product_id(symbol) for symbol in segment.split(",")}
+        actual_leverages = {
+            symbol: get_order_leverage(product_id)
+            for symbol, product_id in product_ids.items()
+        }
+    except Exception as exc:
+        return jsonify(error=f"Could not verify Delta leverage; no strategy was started: {exc}"), 502
+    mismatches = [
+        f"{symbol} is {actual}x"
+        for symbol, actual in actual_leverages.items()
+        if actual != int(leverage)
+    ]
+    if mismatches:
+        return jsonify(error=(
+            f"Delta reports {', '.join(mismatches)}. Set {leverage}x in Delta for the selected "
+            "contract(s), then start again. No orders were placed."
+        )), 409
     try:
         btc_size = int(body.get("btc_size", selected_sizes["BTC_SIZE"]))
         eth_size = int(body.get("eth_size", selected_sizes["ETH_SIZE"]))

@@ -244,17 +244,10 @@ def get_product_tick_size(symbol: str) -> Decimal:
     return PRODUCT_TICK_SIZES[symbol]
 
 
-def set_order_leverage(product_id: int, leverage: int) -> None:
-    """Set Delta's order leverage for this contract before placing new orders."""
-    if leverage not in SUPPORTED_LEVERAGES:
-        raise ValueError("LEVERAGE must be 20, 50, or 100")
-    signed_request(
-        "POST",
-        f"/v2/products/{product_id}/orders/leverage",
-        # Delta documents leverage as a string in the request schema.
-        body_obj={"leverage": str(leverage)},
-    )
-    log.info("Set Delta order leverage to %sx for product %s", leverage, product_id)
+def get_order_leverage(product_id: int) -> int:
+    """Read the leverage Delta currently reports for this product's orders."""
+    data = signed_request("GET", f"/v2/products/{product_id}/orders/leverage")
+    return int(float(data["result"]["leverage"]))
 
 
 def get_best_quote(symbol: str, side: str) -> str:
@@ -621,7 +614,13 @@ def main() -> None:
     product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
     if LIVE_TRADING:
         for contract in contracts:
-            set_order_leverage(product_ids[contract.symbol], leverage)
+            actual_leverage = get_order_leverage(product_ids[contract.symbol])
+            if actual_leverage != leverage:
+                raise RuntimeError(
+                    f"Selected leverage is {leverage}x for {contract.symbol}, but Delta reports "
+                    f"{actual_leverage}x. Set {leverage}x for {contract.symbol} in Delta, then start again."
+                )
+            log.info("Verified Delta leverage %sx for %s", actual_leverage, contract.symbol)
     last_processed: dict[str, int] = {}
     retry_after: dict[str, float] = {}
     retry_delay: dict[str, int] = {}
