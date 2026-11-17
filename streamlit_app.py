@@ -225,10 +225,13 @@ def run() -> None:
         else:
             label, color = "API ERROR", "#b64f66"
         st.markdown(f"<div style='text-align:center;background:#fff8fc;border:1px solid #e9a6c7;border-radius:14px;padding:10px'><small>Delta API key</small><br><b style='color:{color}'>{label}</b></div>", unsafe_allow_html=True)
-    if delta_ip:
-        st.caption(f"Delta-reported request IP (whitelist this exact address): {delta_ip}")
-    else:
-        st.caption(f"App egress IPs | IPv4: {public_ipv4} | IPv6: {public_ipv6}")
+    with st.container(border=True):
+        st.subheader("IP addresses for Delta whitelist")
+        ip4_col, ip6_col = st.columns(2)
+        ip4_col.metric("IPv4 address", public_ipv4)
+        ip6_col.metric("IPv6 address", public_ipv6)
+        if delta_ip:
+            st.warning(f"Delta-reported request IP (whitelist this exact address): {delta_ip}")
     if SECRETS_CONFIG_ERROR and (not bot.API_KEY or not bot.API_SECRET):
         st.warning(SECRETS_CONFIG_ERROR)
 
