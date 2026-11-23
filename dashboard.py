@@ -429,7 +429,7 @@ def status():
     strategy_timeframe = active_timeframe if running and active_timeframe else selected_timeframe
     if API_KEY and API_SECRET:
         try:
-            symbols = ("BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
+            symbols = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
             product_ids = {symbol: get_product_id(symbol) for symbol in symbols}
             try:
                 margined = get_margined_positions(list(product_ids.values()))

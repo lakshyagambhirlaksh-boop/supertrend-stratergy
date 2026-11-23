@@ -23,7 +23,7 @@ PID_PATH = Path("/tmp/delta_supertrend_bot.pid")
 LOG_PATH = Path("/tmp/delta_supertrend_bot.log")
 TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h")
 TRADE_SYMBOLS = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
-POSITIONS_SYMBOLS = ("BTCUSD",) + TRADE_SYMBOLS
+POSITIONS_SYMBOLS = TRADE_SYMBOLS
 SECRETS_CONFIG_ERROR: str | None = None
 
 
