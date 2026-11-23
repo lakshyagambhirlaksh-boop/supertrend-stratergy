@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,21 @@ ip_cache: dict[str, Any] = {"address": None, "checked_at": 0.0, "error": None}
 ip_lock = threading.Lock()
 supertrend_cache_lock = threading.Lock()
 supertrend_cache: dict[tuple[str, str], tuple[int, float, int]] = {}
+product_id_cache: dict[str, int] = {}
+product_id_cache_lock = threading.Lock()
+
+
+def get_dashboard_product_ids(symbols: tuple[str, ...]) -> dict[str, int]:
+    """Resolve missing product IDs concurrently and cache them for dashboard refreshes."""
+    with product_id_cache_lock:
+        missing = [symbol for symbol in symbols if symbol not in product_id_cache]
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(6, len(missing))) as pool:
+            resolved = dict(zip(missing, pool.map(get_product_id, missing)))
+        with product_id_cache_lock:
+            product_id_cache.update(resolved)
+    with product_id_cache_lock:
+        return {symbol: product_id_cache[symbol] for symbol in symbols}
 
 
 def get_supertrend_reference(symbol: str, timeframe: str) -> tuple[float, int]:
@@ -229,8 +245,22 @@ async function startBot() {
   const sizes = {lots_per_segment:lots};
   const sizeText = `${lots} lots per selected segment`;
   if (!confirm(`Start LIVE trading on ${symbols.map(s => s.replace('USD','')).join(' + ')} using ${timeframe}? Size: ${sizeText}. Unfilled maker orders switch to market after a fixed 10 seconds.`)) return;
-  const r = await fetch('/api/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe,segment,...sizes})});
-  const d = await r.json(); if (!r.ok) alert(d.error || 'Could not start strategy.'); refresh();
+  $('status').textContent = 'RUNNING · STARTING';
+  $('status').className = 'state on';
+  $('live').textContent = 'Starting the strategy and connecting to Delta…';
+  $('start').disabled = true;
+  $('stop').disabled = false;
+  try {
+    const r = await fetch('/api/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe,segment,...sizes})});
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || 'Could not start strategy.'); refresh(); return; }
+    // Refresh runs in the background; Delta's position endpoints can respond
+    // more slowly than the local process launch, so don't delay this feedback.
+    refresh();
+  } catch (e) {
+    alert('Could not reach the local dashboard. Check that it is running, then refresh this page.');
+    refresh();
+  }
 }
 async function stopBot() {
   if (!confirm('Stop the strategy and cancel its pending orders? Any open Delta positions will remain open.')) return;
@@ -432,12 +462,15 @@ def status():
     if API_KEY and API_SECRET:
         try:
             symbols = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "SOXLBUSD", "MVLLBUSD")
-            product_ids = {symbol: get_product_id(symbol) for symbol in symbols}
+            # Product metadata is static and was being fetched again on every
+            # two-second dashboard poll. Resolve once, in parallel, then reuse.
+            product_ids = get_dashboard_product_ids(symbols)
             try:
                 margined = get_margined_positions(list(product_ids.values()))
             except Exception:
                 margined = {}
-            for symbol in symbols:
+
+            def read_symbol(symbol: str) -> dict[str, Any]:
                 product_id = product_ids[symbol]
                 position_size = get_position(product_id)
                 supertrend_sl = None
@@ -473,12 +506,17 @@ def status():
                             stop_loss = str(candidate)
                             break
                 margin_position = margined.get(symbol, {})
-                positions.append({"symbol": symbol, "size": position_size,
-                                  "mark_price": mark_price, "pending_order": pending_order,
-                                  "unrealized_pnl": margin_position.get("unrealized_pnl"),
-                                  "stop_loss": stop_loss,
-                                  "supertrend_sl": supertrend_sl,
-                                  "supertrend_direction": supertrend_direction})
+                return {"symbol": symbol, "size": position_size,
+                        "mark_price": mark_price, "pending_order": pending_order,
+                        "unrealized_pnl": margin_position.get("unrealized_pnl"),
+                        "stop_loss": stop_loss,
+                        "supertrend_sl": supertrend_sl,
+                        "supertrend_direction": supertrend_direction}
+
+            # These independent reads were sequential, so a slow Delta response
+            # for one segment delayed the entire dashboard refresh/start display.
+            with ThreadPoolExecutor(max_workers=len(symbols)) as pool:
+                positions = list(pool.map(read_symbol, symbols))
         except Exception as exc:
             positions_error = str(exc)
     else:

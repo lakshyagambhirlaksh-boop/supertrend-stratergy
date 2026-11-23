@@ -16,6 +16,7 @@ import signal
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -631,8 +632,13 @@ def main() -> None:
                 else:
                     log.info("Paper mode: no orders will be sent. Set ENABLE_LIVE_TRADING=true to enable live orders.")
 
-                # Resolve every contract before trading.
-                product_ids = {contract.symbol: get_product_id(contract.symbol) for contract in contracts}
+                # Product lookups are independent. Resolve selected contracts
+                # concurrently so startup doesn't wait through one network
+                # timeout after another when several segments are selected.
+                with ThreadPoolExecutor(max_workers=min(6, len(contracts))) as pool:
+                    resolved_ids = list(pool.map(get_product_id, [c.symbol for c in contracts]))
+                product_ids = {contract.symbol: product_id
+                               for contract, product_id in zip(contracts, resolved_ids)}
                 report_status("OK", "Connected; monitoring selected contracts")
                 break
             except Exception as exc:
