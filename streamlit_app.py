@@ -22,7 +22,7 @@ BOT_PATH = ROOT / "supertrend_delta_bot.py"
 PID_PATH = Path("/tmp/delta_supertrend_bot.pid")
 LOG_PATH = Path("/tmp/delta_supertrend_bot.log")
 TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h")
-TRADE_SYMBOLS = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
+TRADE_SYMBOLS = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "SOXLBUSD")
 POSITIONS_SYMBOLS = TRADE_SYMBOLS
 SECRETS_CONFIG_ERROR: str | None = None
 
@@ -227,7 +227,7 @@ def run() -> None:
     title_col, api_col = st.columns([4, 1])
     with title_col:
         st.title("Delta SuperTrend")
-        st.caption("ETHUSD / SOLUSD / BNBUSD / SNDKBUSD / CROSSUSD perpetuals | SuperTrend 15, 3 | Delta mark-price candles")
+        st.caption("ETHUSD / SOLUSD / BNBUSD / SNDKBUSD / SOXLBUSD perpetuals | SuperTrend 15, 3 | Delta mark-price candles")
     with api_col:
         if api_authenticated:
             label, color = "CONNECTED", "#008b69"

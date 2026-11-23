@@ -1,4 +1,4 @@
-"""Delta India SuperTrend reversal bot for ETH, SOL, BNB, SNDKB, and CROSS perpetuals.
+"""Delta India SuperTrend reversal bot for ETH, SOL, BNB, SNDKB, and SOXL perpetuals.
 
 Signals use Delta mark-price candles and SuperTrend(15, 3) on the selected timeframe.
 The script only evaluates completed candles. Live order placement is disabled
@@ -79,15 +79,15 @@ def configured_contracts() -> list[Contract]:
         "SOLUSD": Contract("SOLUSD", int(os.getenv("LOTS_PER_SEGMENT", os.getenv("SOL_SIZE", "1")))),
         "BNBUSD": Contract("BNBUSD", int(os.getenv("LOTS_PER_SEGMENT", os.getenv("BNB_SIZE", "1")))),
         "SNDKBUSD": Contract("SNDKBUSD", int(os.getenv("LOTS_PER_SEGMENT", os.getenv("SNDKB_SIZE", "1")))),
-        "CROSSUSD": Contract("CROSSUSD", int(os.getenv("LOTS_PER_SEGMENT", os.getenv("CROSS_SIZE", "1")))),
+        "SOXLBUSD": Contract("SOXLBUSD", int(os.getenv("LOTS_PER_SEGMENT", os.getenv("SOXLB_SIZE", "1")))),
     }
     selected_symbols = [
         symbol.strip().upper()
-        for symbol in os.getenv("TRADE_SYMBOLS", "ETHUSD,SOLUSD,BNBUSD,SNDKBUSD,CROSSUSD").split(",")
+        for symbol in os.getenv("TRADE_SYMBOLS", "ETHUSD,SOLUSD,BNBUSD,SNDKBUSD,SOXLBUSD").split(",")
         if symbol.strip()
     ]
     if not selected_symbols or any(symbol not in all_contracts for symbol in selected_symbols):
-        raise ValueError("TRADE_SYMBOLS must contain ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, and/or CROSSUSD")
+        raise ValueError("TRADE_SYMBOLS must contain ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, and/or SOXLBUSD")
     contracts = [all_contracts[symbol] for symbol in dict.fromkeys(selected_symbols)]
     if any(contract.size <= 0 for contract in contracts):
         raise ValueError("All configured segment lot sizes must be positive integers")
