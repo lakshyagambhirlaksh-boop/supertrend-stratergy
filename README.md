@@ -1,51 +1,37 @@
-# Delta SuperTrend BTC/ETH futures bot
+# Delta SuperTrend futures bot
 
-This bot follows the chart settings shown: **mark-price candles**, **SuperTrend length 15**, **factor 3**. Set `TIMEFRAME` in `.env` to one of `1m`, `3m`, `5m`, `15m`, `30m`, or `1h` (default: `1m`). It runs one timeframe for the selected BTC/ETH segment at a time.
+This bot trades Delta India perpetual futures using **SuperTrend (length 15, factor 3)** on completed mark-price candles. Choose `1m`, `3m`, `5m`, `15m`, `30m`, or `1h`.
 
-- Green SuperTrend at a completed candle: close a short if present, then go long.
-- Red SuperTrend at a completed candle: close a long if present, then go short.
-- While the trend color is unchanged, it leaves the position alone.
-- Orders begin as post-only GTC limit orders at the passive best bid/ask. If still unfilled after a fixed 10 seconds, the bot cancels the maker order and sends the remaining amount as a market order. The fallback can incur taker fees. The bot tracks pending orders and changes them when the desired side changes.
+- Green SuperTrend: target a long position.
+- Red SuperTrend: target a short position.
+- A color change reverses the position after the candle closes.
 
-It uses Delta India public mark-price OHLC data for signals and Delta India futures post-only limit orders for execution. Unfilled maker orders are repriced to the current passive best bid/ask at 3 and 6 seconds. At 10 seconds, the bot cancels the pending maker order(s) and uses a market fallback for any remaining target quantity. Position size is set as integer contract lots separately for BTCUSD and ETHUSD.
+The dashboard offers ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, and CROSSUSD. **Select all** is on by default. BTCUSD is not a trading selection, but its position remains visible in the positions panel so an existing BTC position can be monitored.
 
-On a SuperTrend reversal, the bot submits the reduce-only close limit and the new-direction entry limit in the same reconciliation cycle. Both are tracked while pending; if either reaches the 10-second timeout, the bot cancels the reversal pair before reconciling the net position at market.
+Set one shared `LOTS_PER_SEGMENT` value. That many contract lots are used for every selected instrument. Each product's contract size and exposure can differ.
 
-## Setup on Windows PowerShell
+Orders start as post-only limit orders and are repriced after 3 and 6 seconds. At 10 seconds, an unfilled remainder may fall back to a market order and incur taker fees. A reversal submits the reduce-only close and new-side entry orders in the same reconciliation cycle. Stopping the bot cancels its pending orders and leaves positions open.
+
+## Setup
+
+Copy `.env.example` to `.env`, then enter your Delta API credentials. Keep `.env` private and do not commit it. `ENABLE_LIVE_TRADING` defaults to `false`; set it to `true` only when you intend to place live orders.
+
+Install and run on Windows PowerShell:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+python .\dashboard.py
 ```
 
-Open `.env` and enter your Delta API key and secret. Do not share this file or paste the credentials into chat. Create a Delta key with only the permissions required for your chosen mode; read access is enough for paper mode, and trading permission is needed for live orders.
+Open `http://127.0.0.1:8765`. The dashboard is bound to localhost by default. For VPS access, use an SSH tunnel rather than exposing the unauthenticated control page publicly.
 
-## Run in paper mode
+The dashboard saves timeframe, segment selection, and shared lot size into `.env`. It retries temporary bot errors, but trading pauses while the exchange or API is unavailable. The bot does not set an exchange stop-loss or take-profit.
 
-Keep `ENABLE_LIVE_TRADING=false` in `.env`, then run:
+## Streamlit Cloud
 
-```powershell
-python .\supertrend_delta_bot.py
-```
-
-Paper mode fetches data and prints the orders it would place; it does not send orders. By default it logs a 1-lot position for each instrument. Set `BTC_SIZE` and `ETH_SIZE` to the desired contract lots before running.
-
-## Live orders
-
-Only after reviewing the code and checking paper behavior, set `ENABLE_LIVE_TRADING=true` in `.env`. Live mode reads the current position and uses a reduce-only post-only limit order to close it before opening the opposite side. If the order is still unfilled after the timeout, it falls back to a market order for the remaining quantity. It does not set a stop-loss, take-profit, or account risk limits.
-
-## Dashboard
-
-Install requirements, then run `python .\dashboard.py` and open `http://127.0.0.1:8765`. Choose a timeframe, BTC/ETH/both segment, and contract lot sizes, then press **Start live strategy** to launch the bot. Settings are saved into `.env` and can be changed while the strategy is stopped. Start may place post-only limit orders immediately to align positions with the current closed candle. **Stop strategy** terminates the bot and leaves any open positions on Delta unchanged. The dashboard binds to localhost by default; on a VPS, use an SSH tunnel rather than exposing this unauthenticated control page to the public internet.
-
-The bot reconciles its position to the current completed candle when it starts, then checks for each new completed candle in the selected timeframe. Keep the process running; it does not restore order history or protect against an unexpected manual trade between checks.
-
-The dashboard keeps the strategy requested as running until **Stop strategy** is pressed. The bot retries startup and runtime errors with a bounded delay, and the dashboard restarts the child process if it exits unexpectedly. During recovery it pauses its own order actions and shows the latest error; it does not guarantee trading continues while Delta or the API is unavailable.
-
-## Streamlit Cloud deployment
-
-Set the Streamlit Cloud app's **Main file path** to `streamlit_app.py` (the previous `supertrend_delta_bot.py` entry is also routed to the UI to avoid the signal-handler crash). Add the credentials under **App settings → Secrets**, using TOML:
+Use `streamlit_app.py` as the main file. Add credentials in **App settings → Secrets** using TOML:
 
 ```toml
 DELTA_API_KEY = "your-key"
@@ -53,4 +39,4 @@ DELTA_API_SECRET = "your-secret"
 DELTA_API_BASE = "https://api.india.delta.exchange"
 ```
 
-The Streamlit page starts live trading only when **Start live strategy** is clicked. Delta API keys must allow the Streamlit app's outbound IP; the dashboard shows the IP and reports Delta's observed IP when the exchange includes it in an API error. Never commit credentials to GitHub.
+The Streamlit page starts live trading only after **Start live strategy** is clicked. Whitelist the app's outbound IP in Delta when required.

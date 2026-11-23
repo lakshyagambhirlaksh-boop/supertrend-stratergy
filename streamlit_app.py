@@ -22,7 +22,8 @@ BOT_PATH = ROOT / "supertrend_delta_bot.py"
 PID_PATH = Path("/tmp/delta_supertrend_bot.pid")
 LOG_PATH = Path("/tmp/delta_supertrend_bot.log")
 TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h")
-SYMBOLS = {"BTC only": "BTCUSD", "ETH only": "ETHUSD", "BTC + ETH": "BTCUSD,ETHUSD"}
+TRADE_SYMBOLS = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
+POSITIONS_SYMBOLS = ("BTCUSD",) + TRADE_SYMBOLS
 SECRETS_CONFIG_ERROR: str | None = None
 
 
@@ -72,7 +73,7 @@ def _read_pid() -> int | None:
         return None
 
 
-def _start(timeframe: str, segment: str, btc_lots: int, eth_lots: int) -> None:
+def _start(timeframe: str, segment: str, lots_per_segment: int) -> None:
     if not bot.API_KEY or not bot.API_SECRET:
         raise RuntimeError("Set DELTA_API_KEY and DELTA_API_SECRET in Streamlit Cloud app secrets.")
     if _read_pid():
@@ -81,8 +82,7 @@ def _start(timeframe: str, segment: str, btc_lots: int, eth_lots: int) -> None:
     env.update({
         "TIMEFRAME": timeframe,
         "TRADE_SYMBOLS": segment,
-        "BTC_SIZE": str(btc_lots),
-        "ETH_SIZE": str(eth_lots),
+        "LOTS_PER_SEGMENT": str(lots_per_segment),
         "ENABLE_LIVE_TRADING": "true",
     })
     log_file = LOG_PATH.open("a", encoding="utf-8")
@@ -131,7 +131,7 @@ def _live_data() -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
     if not bot.API_KEY or not bot.API_SECRET:
         return rows, "Add Delta API credentials to Streamlit app secrets.", None, False
     try:
-        products = {symbol: bot.get_product_id(symbol) for symbol in ("BTCUSD", "ETHUSD")}
+        products = {symbol: bot.get_product_id(symbol) for symbol in POSITIONS_SYMBOLS}
         margined: dict[str, dict[str, Any]] = {}
         try:
             payload = bot.signed_request("GET", "/v2/positions/margined", {
@@ -227,7 +227,7 @@ def run() -> None:
     title_col, api_col = st.columns([4, 1])
     with title_col:
         st.title("Delta SuperTrend")
-        st.caption("BTCUSD / ETHUSD perpetuals | SuperTrend length 15, factor 3 | Delta mark-price candles")
+        st.caption("ETHUSD / SOLUSD / BNBUSD / SNDKBUSD / CROSSUSD perpetuals | SuperTrend 15, 3 | Delta mark-price candles")
     with api_col:
         if api_authenticated:
             label, color = "CONNECTED", "#008b69"
@@ -260,18 +260,41 @@ def run() -> None:
             st.markdown(f"<h3 style='margin-top:0;color:{state_color}'>{'RUNNING' if running else 'STOPPED'}</h3>", unsafe_allow_html=True)
             st.caption("Live order placement is enabled when you start the strategy.")
             timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
-            segment_label = st.selectbox("Trading segment", tuple(SYMBOLS))
-            active_symbols = SYMBOLS[segment_label].split(",")
-            btc_lots, eth_lots = 1, 1
-            size_cols = st.columns(2)
-            if "BTCUSD" in active_symbols:
-                btc_lots = size_cols[0].number_input("BTC lots", min_value=1, value=1, step=1)
-            if "ETHUSD" in active_symbols:
-                eth_lots = size_cols[1].number_input("ETH lots", min_value=1, value=1, step=1)
+            if "selected_trade_symbols" not in st.session_state:
+                configured = [s.strip().upper() for s in os.getenv("TRADE_SYMBOLS", ",".join(TRADE_SYMBOLS)).split(",")]
+                st.session_state.selected_trade_symbols = [s for s in TRADE_SYMBOLS if s in configured]
+            for symbol in TRADE_SYMBOLS:
+                key = f"segment_{symbol}"
+                if key not in st.session_state:
+                    st.session_state[key] = symbol in st.session_state.selected_trade_symbols
+            if "select_all_segments" not in st.session_state:
+                st.session_state.select_all_segments = all(st.session_state[f"segment_{s}"] for s in TRADE_SYMBOLS)
+
+            def sync_all_segments() -> None:
+                for selected_symbol in TRADE_SYMBOLS:
+                    st.session_state[f"segment_{selected_symbol}"] = st.session_state.select_all_segments
+
+            def sync_master_state() -> None:
+                st.session_state.select_all_segments = all(
+                    st.session_state[f"segment_{selected_symbol}"] for selected_symbol in TRADE_SYMBOLS
+                )
+
+            st.caption("Trading segments")
+            st.checkbox("Select all", key="select_all_segments", disabled=running, on_change=sync_all_segments)
+            segment_cols = st.columns(len(TRADE_SYMBOLS))
+            for index, symbol in enumerate(TRADE_SYMBOLS):
+                segment_cols[index].checkbox(symbol, key=f"segment_{symbol}", disabled=running, on_change=sync_master_state)
+            active_symbols = [s for s in TRADE_SYMBOLS if st.session_state[f"segment_{s}"]]
+            lots_per_segment = st.number_input(
+                "Lots for each selected segment", min_value=1, max_value=10000,
+                value=max(1, int(os.getenv("LOTS_PER_SEGMENT", "1"))), step=1, disabled=running,
+            )
             button_cols = st.columns(2)
             if button_cols[0].button("Start live strategy", disabled=running, use_container_width=True):
                 try:
-                    _start(timeframe, SYMBOLS[segment_label], int(btc_lots), int(eth_lots))
+                    if not active_symbols:
+                        raise RuntimeError("Select at least one trading segment.")
+                    _start(timeframe, ",".join(active_symbols), int(lots_per_segment))
                     st.success("Live strategy started.")
                     st.rerun()
                 except Exception as exc:

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ BOT_PATH = ROOT / "supertrend_delta_bot.py"
 LOG_PATH = ROOT / "strategy.log"
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8765"))
+SUPPORTED_SYMBOLS = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
+SUPPORTED_SEGMENTS = {",".join(c) for size in range(1, len(SUPPORTED_SYMBOLS) + 1) for c in combinations(SUPPORTED_SYMBOLS, size)}
 
 app = Flask(__name__)
 log = logging.getLogger("delta-supertrend-dashboard")
@@ -50,10 +53,14 @@ last_bot_launch_at = 0.0
 active_timeframe: str | None = None
 active_segment: str | None = None
 selected_timeframe = os.getenv("TIMEFRAME", "1m").strip().lower()
-selected_segment = os.getenv("TRADE_SYMBOLS", "BTCUSD,ETHUSD").strip().upper()
+selected_segment = os.getenv("TRADE_SYMBOLS", "ETHUSD,SOLUSD,BNBUSD,SNDKBUSD,CROSSUSD").strip().upper()
 selected_sizes = {
-    "BTC_SIZE": int(os.getenv("BTC_SIZE", "1")),
     "ETH_SIZE": int(os.getenv("ETH_SIZE", "1")),
+    "SOL_SIZE": int(os.getenv("SOL_SIZE", "1")),
+    "BNB_SIZE": int(os.getenv("BNB_SIZE", "1")),
+    "SNDKB_SIZE": int(os.getenv("SNDKB_SIZE", "1")),
+    "CROSS_SIZE": int(os.getenv("CROSS_SIZE", "1")),
+    "LOTS_PER_SEGMENT": int(os.getenv("LOTS_PER_SEGMENT", os.getenv("ETH_SIZE", "1"))),
 }
 last_error: str | None = None
 ip_cache: dict[str, Any] = {"address": None, "checked_at": 0.0, "error": None}
@@ -111,7 +118,7 @@ PAGE = r'''<!doctype html>
 </head>
 <body><main>
   <div class="topbar">
-    <div><h1>Delta SuperTrend</h1><p class="sub">BTCUSD and ETHUSD perpetuals · SuperTrend length 15, factor 3 · mark-price candles</p></div>
+    <div><h1>Delta SuperTrend</h1><p class="sub">ETH, SOL, BNB, SNDKB and CROSS perpetuals · SuperTrend 15, factor 3 · mark-price candles</p></div>
     <div class="api-badge"><div class="label">Delta API key</div><div id="apiConnection" class="connection-value">Checking…</div></div>
   </div>
   <div class="grid">
@@ -121,11 +128,17 @@ PAGE = r'''<!doctype html>
       <div style="margin-top:18px">
         <label for="timeframe" class="label">Timeframe</label><br>
         <select id="timeframe"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option><option>1h</option></select>
-        <label for="segment" class="label">Trading segment</label><br>
-        <select id="segment"><option value="BTCUSD">BTC only</option><option value="ETHUSD">ETH only</option><option value="BTCUSD,ETHUSD">Both BTC and ETH</option></select>
+        <div class="label" style="margin-top:10px">Trading segments</div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px">
+          <label><input id="selectAllSegments" type="checkbox" style="width:16px"> Select all</label>
+          <label><input class="segment-check" type="checkbox" value="CROSSUSD" style="width:16px"> CROSSUSD</label>
+          <label><input class="segment-check" type="checkbox" value="ETHUSD" style="width:16px"> ETH</label>
+          <label><input class="segment-check" type="checkbox" value="SOLUSD" style="width:16px"> SOL</label>
+          <label><input class="segment-check" type="checkbox" value="BNBUSD" style="width:16px"> BNB</label>
+          <label><input class="segment-check" type="checkbox" value="SNDKBUSD" style="width:16px"> SNDKBUSD</label>
+        </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
-          <label id="btcLotField" class="label">BTC lots<br><input id="btcSize" type="number" min="1" max="10000" step="1" value="1"></label>
-          <label id="ethLotField" class="label">ETH lots<br><input id="ethSize" type="number" min="1" max="10000" step="1" value="1"></label>
+          <label id="lotsField" class="label">Lots for each selected segment<br><input id="lotsPerSegment" type="number" min="1" max="10000" step="1" value="1"></label>
         </div>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
@@ -166,12 +179,17 @@ async function refresh() {
     $('start').disabled = d.running || !d.live_enabled;
     $('stop').disabled = !d.running;
     $('timeframe').disabled = d.running;
-    $('segment').disabled = d.running;
-    $('btcSize').disabled = d.running;
-    $('ethSize').disabled = d.running;
-    if (!d.running) { $('btcSize').value = d.sizes.BTC_SIZE; $('ethSize').value = d.sizes.ETH_SIZE; }
+    document.querySelectorAll('.segment-check').forEach(el => el.disabled = d.running);
+    $('selectAllSegments').disabled = d.running;
+    $('lotsPerSegment').disabled = d.running;
+    if (!d.running) $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
     if (d.timeframe) $('timeframe').value = d.timeframe;
-    if (d.segment) $('segment').value = d.segment;
+    if (d.segment) {
+      const active = d.segment.split(',');
+      document.querySelectorAll('.segment-check').forEach(el => el.checked = active.includes(el.value));
+      $('selectAllSegments').checked = active.length === 5;
+      $('selectAllSegments').indeterminate = active.length > 0 && active.length < 5;
+    }
     updateLotVisibility();
     if (d.positions_error) $('positions').innerHTML = `<p class="error">Could not read Delta positions: ${escapeHtml(d.positions_error)}</p>`;
     else $('positions').innerHTML = d.positions.map(p => {
@@ -194,19 +212,22 @@ async function refresh() {
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function formatPrice(value) { const price = Number(value); return Number.isFinite(price) ? price.toFixed(2) : 'unavailable'; }
 function formatPnl(value) { const pnl = Number(value); return Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : 'unavailable'; }
-function updateLotVisibility() {
-  const segment = $('segment').value;
-  $('btcLotField').style.display = segment === 'ETHUSD' ? 'none' : 'block';
-  $('ethLotField').style.display = segment === 'BTCUSD' ? 'none' : 'block';
+function selectedSymbols() {
+  return ['ETHUSD','SOLUSD','BNBUSD','SNDKBUSD','CROSSUSD'].filter(symbol =>
+    document.querySelector(`.segment-check[value="${symbol}"]`).checked);
 }
+function updateLotVisibility() {}
 async function startBot() {
   const timeframe = $('timeframe').value;
-  const segment = $('segment').value;
-  const btcSize = Number($('btcSize').value), ethSize = Number($('ethSize').value);
-  if (!Number.isInteger(btcSize) || btcSize < 1 || btcSize > 10000 || !Number.isInteger(ethSize) || ethSize < 1 || ethSize > 10000) { alert('Lot sizes must be whole numbers from 1 to 10000.'); return; }
-  const sizeText = segment === 'BTCUSD' ? `BTC ${btcSize} lots` : segment === 'ETHUSD' ? `ETH ${ethSize} lots` : `BTC ${btcSize} lots and ETH ${ethSize} lots`;
-  if (!confirm(`Start LIVE trading on ${segment === 'BTCUSD,ETHUSD' ? 'BTC and ETH' : segment.replace('USD','')} using ${timeframe}? Size: ${sizeText}. Unfilled maker orders switch to market after a fixed 10 seconds.`)) return;
-  const r = await fetch('/api/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe,segment,btc_size:btcSize,eth_size:ethSize})});
+  const symbols = selectedSymbols();
+  if (!symbols.length) { alert('Select at least one trading segment.'); return; }
+  const segment = symbols.join(',');
+  const lots = Number($('lotsPerSegment').value);
+  if (!Number.isInteger(lots) || lots < 1 || lots > 10000) { alert('Lots must be a whole number from 1 to 10000.'); return; }
+  const sizes = {lots_per_segment:lots};
+  const sizeText = `${lots} lots per selected segment`;
+  if (!confirm(`Start LIVE trading on ${symbols.map(s => s.replace('USD','')).join(' + ')} using ${timeframe}? Size: ${sizeText}. Unfilled maker orders switch to market after a fixed 10 seconds.`)) return;
+  const r = await fetch('/api/start', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe,segment,...sizes})});
   const d = await r.json(); if (!r.ok) alert(d.error || 'Could not start strategy.'); refresh();
 }
 async function stopBot() {
@@ -217,13 +238,25 @@ async function rememberTimeframe() {
   await saveSettings();
 }
 async function saveSettings() {
-  const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:$('segment').value,btc_size:Number($('btcSize').value),eth_size:Number($('ethSize').value)})});
+  const symbols = selectedSymbols();
+  if (!symbols.length) return;
+  const lots = Number($('lotsPerSegment').value);
+  const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:symbols.join(','),lots_per_segment:lots})});
   if (!r.ok) { const d=await r.json(); alert(d.error || 'Could not save settings.'); }
 }
 $("timeframe").addEventListener('change', rememberTimeframe);
-$("segment").addEventListener('change', () => { updateLotVisibility(); saveSettings(); });
-$("btcSize").addEventListener('change', saveSettings);
-$("ethSize").addEventListener('change', saveSettings);
+function onSegmentCheckboxChange() {
+  const count = selectedSymbols().length;
+  $('selectAllSegments').checked = count === 5;
+  $('selectAllSegments').indeterminate = count > 0 && count < 5;
+  updateLotVisibility(); saveSettings();
+}
+document.querySelectorAll('.segment-check').forEach(el => el.addEventListener('change', onSegmentCheckboxChange));
+$('selectAllSegments').addEventListener('change', () => {
+  document.querySelectorAll('.segment-check').forEach(el => el.checked = $('selectAllSegments').checked);
+  updateLotVisibility(); saveSettings();
+});
+$("lotsPerSegment").addEventListener('change', saveSettings);
 refresh(); setInterval(refresh, 2000);
 </script>
 </body></html>'''
@@ -396,7 +429,7 @@ def status():
     strategy_timeframe = active_timeframe if running and active_timeframe else selected_timeframe
     if API_KEY and API_SECRET:
         try:
-            symbols = ("BTCUSD", "ETHUSD")
+            symbols = ("BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "CROSSUSD")
             product_ids = {symbol: get_product_id(symbol) for symbol in symbols}
             try:
                 margined = get_margined_positions(list(product_ids.values()))
@@ -499,23 +532,23 @@ def set_settings():
     timeframe = str(body.get("timeframe", selected_timeframe)).lower()
     segment = str(body.get("segment", selected_segment)).upper()
     try:
-        btc_size = int(body.get("btc_size", selected_sizes["BTC_SIZE"]))
-        eth_size = int(body.get("eth_size", selected_sizes["ETH_SIZE"]))
+        lots = int(body.get("lots_per_segment", selected_sizes["LOTS_PER_SEGMENT"]))
+        eth_size = sol_size = bnb_size = sndkb_size = cross_size = lots
     except (TypeError, ValueError):
         return jsonify(error="Lot sizes must be whole numbers."), 400
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
-    if segment not in {"BTCUSD", "ETHUSD", "BTCUSD,ETHUSD"}:
-        return jsonify(error="Choose BTC only, ETH only, or both."), 400
-    if not (1 <= btc_size <= 10000 and 1 <= eth_size <= 10000):
+    if segment not in SUPPORTED_SEGMENTS:
+        return jsonify(error="Choose one or more supported ETH, SOL, BNB, SNDKB, or CROSSUSD segments."), 400
+    if not (1 <= lots <= 10000):
         return jsonify(error="Lot sizes must be from 1 to 10000."), 400
     with state_lock:
         if strategy_requested_running or process_is_running():
             return jsonify(error="Stop the strategy before changing settings."), 409
         selected_timeframe = timeframe
         selected_segment = segment
-        selected_sizes = {"BTC_SIZE": btc_size, "ETH_SIZE": eth_size}
-        persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "BTC_SIZE": str(btc_size), "ETH_SIZE": str(eth_size)})
+        selected_sizes = {"ETH_SIZE": eth_size, "SOL_SIZE": sol_size, "BNB_SIZE": bnb_size, "SNDKB_SIZE": sndkb_size, "CROSS_SIZE": cross_size, "LOTS_PER_SEGMENT": lots}
+        persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "ETH_SIZE": str(eth_size), "SOL_SIZE": str(sol_size), "BNB_SIZE": str(bnb_size), "SNDKB_SIZE": str(sndkb_size), "CROSS_SIZE": str(cross_size), "LOTS_PER_SEGMENT": str(lots)})
     return jsonify(ok=True, timeframe=timeframe, segment=segment, sizes=selected_sizes)
 
 
@@ -530,14 +563,14 @@ def start():
     segment = str(body.get("segment", selected_segment)).upper()
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
-    if segment not in {"BTCUSD", "ETHUSD", "BTCUSD,ETHUSD"}:
-        return jsonify(error="Choose BTC only, ETH only, or both."), 400
+    if segment not in SUPPORTED_SEGMENTS:
+        return jsonify(error="Choose one or more supported ETH, SOL, BNB, SNDKB, or CROSSUSD segments."), 400
     try:
-        btc_size = int(body.get("btc_size", selected_sizes["BTC_SIZE"]))
-        eth_size = int(body.get("eth_size", selected_sizes["ETH_SIZE"]))
+        lots = int(body.get("lots_per_segment", selected_sizes["LOTS_PER_SEGMENT"]))
+        eth_size = sol_size = bnb_size = sndkb_size = cross_size = lots
     except (TypeError, ValueError):
         return jsonify(error="Lot sizes must be whole numbers."), 400
-    if not (1 <= btc_size <= 10000 and 1 <= eth_size <= 10000):
+    if not (1 <= lots <= 10000):
         return jsonify(error="Lot sizes must be from 1 to 10000."), 400
 
     with state_lock:
@@ -546,8 +579,12 @@ def start():
         env = os.environ.copy()
         env["TIMEFRAME"] = timeframe
         env["TRADE_SYMBOLS"] = segment
-        env["BTC_SIZE"] = str(btc_size)
         env["ETH_SIZE"] = str(eth_size)
+        env["SOL_SIZE"] = str(sol_size)
+        env["BNB_SIZE"] = str(bnb_size)
+        env["SNDKB_SIZE"] = str(sndkb_size)
+        env["CROSS_SIZE"] = str(cross_size)
+        env["LOTS_PER_SEGMENT"] = str(lots)
         try:
             strategy_environment = env.copy()
             bot_process = launch_bot(strategy_environment)
@@ -559,8 +596,8 @@ def start():
             active_segment = segment
             selected_timeframe = timeframe
             selected_segment = segment
-            selected_sizes = {"BTC_SIZE": btc_size, "ETH_SIZE": eth_size}
-            persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "BTC_SIZE": str(btc_size), "ETH_SIZE": str(eth_size)})
+            selected_sizes = {"ETH_SIZE": eth_size, "SOL_SIZE": sol_size, "BNB_SIZE": bnb_size, "SNDKB_SIZE": sndkb_size, "CROSS_SIZE": cross_size, "LOTS_PER_SEGMENT": lots}
+            persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "ETH_SIZE": str(eth_size), "SOL_SIZE": str(sol_size), "BNB_SIZE": str(bnb_size), "SNDKB_SIZE": str(sndkb_size), "CROSS_SIZE": str(cross_size), "LOTS_PER_SEGMENT": str(lots)})
             last_error = None
         except OSError as exc:
             bot_process = None
