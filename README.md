@@ -6,7 +6,7 @@ This bot trades Delta India perpetual futures using **SuperTrend (length 15, fac
 - Red SuperTrend: target a short position.
 - A color change reverses the position after the candle closes.
 
-The dashboard offers ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, and SOXLBUSD. **Select all** is on by default.
+The dashboard offers ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, SOXLBUSD, and MVLLBUSD. **Select all** is on by default.
 
 Set one shared `LOTS_PER_SEGMENT` value. That many contract lots are used for every selected instrument. Each product's contract size and exposure can differ.
 
