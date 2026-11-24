@@ -138,7 +138,7 @@ PAGE = r'''<!doctype html>
     .connection-value { font-weight:750; font-size:18px; margin-top:4px; overflow-wrap:anywhere; }
     .pending-order { color:#8b5a00; font-size:12px; font-weight:700; }
     select,button,input { font:inherit; border-radius:9px; padding:10px 13px; border:1px solid var(--line); color:var(--text); background:#fffafd; }
-    select { min-width:150px; } input { width:100px; } button { cursor:pointer; font-weight:650; } button:disabled,select:disabled,input:disabled { opacity:.45; cursor:not-allowed; }
+    select { min-width:150px; } input { width:100px; } #lotsPerSegment { appearance:textfield; -moz-appearance:textfield; } #lotsPerSegment::-webkit-inner-spin-button,#lotsPerSegment::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; } button { cursor:pointer; font-weight:650; } button:disabled,select:disabled,input:disabled { opacity:.45; cursor:not-allowed; }
     .start { background:#078b60; border-color:#078b60; color:white; } .stop { background:#c62848; border-color:#c62848; color:white; margin-left:8px; }
     .trade-row { display:flex; justify-content:space-between; padding:12px 0; border-bottom:1px solid var(--line); } .trade-row:last-child { border:0; }
     .chip { border-radius:999px; padding:3px 10px; font-size:12px; font-weight:700; } .long { color:#075d40; background:#c7f3df; } .short { color:#971b35; background:#ffd7e1; } .flat { color:#5b5260; background:#e9e0e8; }
@@ -204,11 +204,15 @@ PAGE = r'''<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let refreshing = false;
+let dashboardRunning = false;
+let lotSizeDirty = false;
+let submittingLotSize = false;
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
     const r = await fetch('/api/status'); const d = await r.json();
+    dashboardRunning = Boolean(d.running);
     const healthSuffix = d.bot_health === 'RETRYING' ? ' · RETRYING' : d.bot_health === 'RESTARTING' ? ' · RESTARTING' : d.bot_health === 'STOPPING' ? ' · STOPPING' : ` · ${d.timeframe}`;
     $('status').textContent = d.running ? `RUNNING${healthSuffix}` : 'STOPPED';
     $('status').className = `state ${d.running ? 'on' : 'off'}`;
@@ -224,8 +228,8 @@ async function refresh() {
     document.querySelectorAll('.segment-check').forEach(el => el.disabled = d.running);
     $('selectAllSegments').disabled = d.running;
     $('lotsPerSegment').disabled = d.running;
-    $('submitLots').disabled = d.running;
-    if (!d.running) $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
+    $('submitLots').disabled = d.running || submittingLotSize;
+    if (!d.running && !lotSizeDirty && !submittingLotSize) $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
     if (d.timeframe) $('timeframe').value = d.timeframe;
     if (d.segment) {
       const active = d.segment.split(',');
@@ -288,18 +292,23 @@ function updateLotSummary(message) {
 async function submitLotSize() {
   const symbols = selectedSymbols();
   const lots = Number($('lotsPerSegment').value);
+  if (dashboardRunning) { alert('Stop the strategy before submitting a new lot size. It will apply the next time you start.'); return; }
   if (!symbols.length) { alert('Select at least one trading segment.'); return; }
   if (!Number.isInteger(lots) || lots < 1 || lots > 10000) { alert('Lots must be a whole number from 1 to 10000.'); return; }
+  submittingLotSize = true;
   $('submitLots').disabled = true;
   try {
     const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:symbols.join(','),lots_per_segment:lots})});
     const d = await r.json();
     if (!r.ok) { alert(d.error || 'Could not save lot size.'); return; }
+    lotSizeDirty = false;
+    $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
     updateLotSummary(`Saved: ${lots} lot${lots === 1 ? '' : 's'} for each of ${symbols.length} selected segment${symbols.length === 1 ? '' : 's'}. This applies when you next start the strategy.`);
   } catch (e) {
     alert('Could not reach the dashboard to save the lot size.');
   } finally {
-    $('submitLots').disabled = false;
+    submittingLotSize = false;
+    $('submitLots').disabled = dashboardRunning;
   }
 }
 async function startBot() {
@@ -347,8 +356,7 @@ async function rememberTimeframe() {
 async function saveSettings() {
   const symbols = selectedSymbols();
   if (!symbols.length) return;
-  const lots = Number($('lotsPerSegment').value);
-  const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:symbols.join(','),lots_per_segment:lots})});
+  const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:symbols.join(',')})});
   if (!r.ok) { const d=await r.json(); alert(d.error || 'Could not save settings.'); }
 }
 $("timeframe").addEventListener('change', rememberTimeframe);
@@ -365,7 +373,7 @@ $('selectAllSegments').addEventListener('change', () => {
   updateLotSummary();
   updateLotVisibility(); saveSettings();
 });
-$("lotsPerSegment").addEventListener('input', () => updateLotSummary());
+$("lotsPerSegment").addEventListener('input', () => { lotSizeDirty = true; updateLotSummary(); });
 refresh(); setInterval(refresh, 2000);
 </script>
 </body></html>'''
