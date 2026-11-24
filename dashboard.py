@@ -266,10 +266,11 @@ async function refresh() {
       $('tradeActivity').innerHTML = '<p class="note">No Delta fills found for these segments yet.</p>';
     } else {
       $('tradeActivity').innerHTML = `<table class="activity-table"><thead><tr><th>Time (IST)</th><th>Segment</th><th>Entry</th><th>Side</th><th>Entry price</th><th>Exit price</th><th>Realized P&amp;L</th></tr></thead><tbody>${tradeRows.map(t => {
-        const isExit = String(t.event).includes('EXIT') || String(t.event).includes('CLOSE');
+        const stopHit = String(t.event).includes('SL HIT');
+        const isExit = stopHit || String(t.event).includes('EXIT') || String(t.event).includes('CLOSE');
         const side = String(t.event).includes('LONG') ? 'LONG' : String(t.event).includes('SHORT') ? 'SHORT' : '—';
         const pnl = t.realized_pnl === null || t.realized_pnl === undefined ? '—' : formatActivityPnl(t.realized_pnl, t.currency);
-        return `<tr><td>${escapeHtml(t.time)}</td><td>${escapeHtml(t.symbol)}</td><td class="${isExit ? 'activity-exit' : 'activity-entry'}">${isExit ? 'CLOSE' : 'OPEN'}</td><td>${side}</td><td>${t.entry_price == null ? '—' : formatPrice(t.entry_price)}</td><td>${t.exit_price == null ? '—' : formatPrice(t.exit_price)}</td><td>${escapeHtml(pnl)}</td></tr>`;
+        return `<tr><td>${escapeHtml(t.time)}</td><td>${escapeHtml(t.symbol)}</td><td class="${isExit ? 'activity-exit' : 'activity-entry'}">${stopHit ? 'SL HIT' : isExit ? 'CLOSE' : 'OPEN'}</td><td>${side}</td><td>${t.entry_price == null ? '—' : formatPrice(t.entry_price)}</td><td>${t.exit_price == null ? '—' : formatPrice(t.exit_price)}</td><td>${escapeHtml(pnl)}</td></tr>`;
       }).join('')}</tbody></table>`;
     }
   } catch (e) { $('status').textContent = 'Dashboard connection error'; $('status').className='state error'; }
@@ -520,8 +521,11 @@ def parse_fill_time(value: Any) -> tuple[float, str]:
         return 0.0, "—"
 
 
-def summarize_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def summarize_fills(
+    fills: list[dict[str, Any]], stop_order_ids: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Turn Delta fills into entry/exit rows using the position snapshot on each fill."""
+    stop_order_ids = stop_order_ids or set()
     ordered = sorted(fills, key=lambda fill: parse_fill_time(fill.get("created_at"))[0])
     states: dict[str, dict[str, Any]] = {}
     activity: list[dict[str, Any]] = []
@@ -530,6 +534,7 @@ def summarize_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not symbol:
             continue
         side = str(fill.get("side", "")).lower()
+        is_stop_fill = str(fill.get("order_id", "")) in stop_order_ids
         try:
             fill_size = abs(int(float(fill.get("size", 0))))
             fill_price = float(fill.get("price"))
@@ -590,6 +595,8 @@ def summarize_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
             event = "EXIT LONG" if old_sign > 0 else "EXIT SHORT"
             if new_sign != 0 and new_sign != old_sign:
                 event = "REVERSE: CLOSE LONG" if old_sign > 0 else "REVERSE: CLOSE SHORT"
+            if is_stop_fill:
+                event = "SL HIT LONG" if old_sign > 0 else "SL HIT SHORT"
             fill_realized = realized
             if realized is not None and previous_realized is not None and new_sign == old_sign:
                 fill_realized = realized - float(previous_realized)
@@ -616,11 +623,22 @@ def get_recent_trade_activity(product_ids: dict[str, int]) -> tuple[list[dict[st
         if now - trade_activity_cache["checked_at"] < TRADE_ACTIVITY_CACHE_SECONDS:
             return list(trade_activity_cache["rows"]), trade_activity_cache["error"]
     try:
-        payload = signed_request("GET", "/v2/fills", {
+        params = {
             "product_ids": ",".join(str(value) for value in product_ids.values()),
             "page_size": 50,
-        })
-        rows = summarize_fills(payload.get("result", []))
+        }
+        payload = signed_request("GET", "/v2/fills", params)
+        stop_order_ids: set[str] = set()
+        try:
+            history = signed_request("GET", "/v2/orders/history", params)
+            stop_order_ids = {
+                str(order.get("id"))
+                for order in history.get("result", [])
+                if order.get("id") is not None and order.get("stop_order_type") == "stop_loss_order"
+            }
+        except Exception:
+            log.exception("Could not read Delta order history to classify stop-loss fills")
+        rows = summarize_fills(payload.get("result", []), stop_order_ids)
         error = None
     except Exception as exc:
         rows, error = [], str(exc)
