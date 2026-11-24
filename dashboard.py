@@ -46,7 +46,9 @@ app = Flask(__name__)
 log = logging.getLogger("delta-supertrend-dashboard")
 state_lock = threading.Lock()
 bot_process: subprocess.Popen[str] | None = None
+bot_pid: int | None = None
 strategy_requested_running = False
+stopping_requested = False
 strategy_environment: dict[str, str] | None = None
 restart_delay_seconds = 5
 restart_at = 0.0
@@ -71,6 +73,8 @@ supertrend_cache_lock = threading.Lock()
 supertrend_cache: dict[tuple[str, str], tuple[int, float, int]] = {}
 product_id_cache: dict[str, int] = {}
 product_id_cache_lock = threading.Lock()
+status_snapshot_lock = threading.Lock()
+status_snapshot: dict[str, Any] | None = None
 
 
 def get_dashboard_product_ids(symbols: tuple[str, ...]) -> dict[str, int]:
@@ -187,15 +191,17 @@ async function refresh() {
   refreshing = true;
   try {
     const r = await fetch('/api/status'); const d = await r.json();
-    const healthSuffix = d.bot_health === 'RETRYING' ? ' · RETRYING' : d.bot_health === 'RESTARTING' ? ' · RESTARTING' : ` · ${d.timeframe}`;
+    const healthSuffix = d.bot_health === 'RETRYING' ? ' · RETRYING' : d.bot_health === 'RESTARTING' ? ' · RESTARTING' : d.bot_health === 'STOPPING' ? ' · STOPPING' : ` · ${d.timeframe}`;
     $('status').textContent = d.running ? `RUNNING${healthSuffix}` : 'STOPPED';
     $('status').className = `state ${d.running ? 'on' : 'off'}`;
-    $('live').textContent = d.running && (d.bot_health === 'RETRYING' || d.bot_health === 'RESTARTING')
+    $('live').textContent = d.running && d.bot_health === 'STOPPING'
+      ? 'Stopping the strategy and cancelling pending bot orders. Open positions remain open.'
+      : d.running && (d.bot_health === 'RETRYING' || d.bot_health === 'RESTARTING')
       ? `Bot remains active and will retry; trading is paused during recovery: ${d.bot_message || 'retrying'}`
       : d.live_enabled ? 'Live order placement is enabled.' : 'Live order placement is disabled in .env.';
     $('live').className = `note ${d.live_enabled ? 'error' : ''}`;
     $('start').disabled = d.running || !d.live_enabled;
-    $('stop').disabled = !d.running;
+    $('stop').disabled = !d.running || d.bot_health === 'STOPPING';
     $('timeframe').disabled = d.running;
     document.querySelectorAll('.segment-check').forEach(el => el.disabled = d.running);
     $('selectAllSegments').disabled = d.running;
@@ -264,7 +270,15 @@ async function startBot() {
 }
 async function stopBot() {
   if (!confirm('Stop the strategy and cancel its pending orders? Any open Delta positions will remain open.')) return;
-  const r = await fetch('/api/stop', {method:'POST'}); const d = await r.json(); if (!r.ok) alert(d.error || 'Could not stop strategy.'); refresh();
+  $('status').textContent = 'STOPPING';
+  $('status').className = 'state on';
+  $('live').textContent = 'Stopping the strategy and cancelling pending bot orders. Open positions remain open.';
+  $('stop').disabled = true;
+  try {
+    const r = await fetch('/api/stop', {method:'POST'}); const d = await r.json();
+    if (!r.ok) alert(d.error || 'Could not stop strategy.');
+  } catch (e) { alert('Could not reach the local dashboard. Check that it is running, then refresh this page.'); }
+  refresh();
 }
 async function rememberTimeframe() {
   await saveSettings();
@@ -295,7 +309,55 @@ refresh(); setInterval(refresh, 2000);
 
 
 def process_is_running() -> bool:
-    return bot_process is not None and bot_process.poll() is None
+    if bot_process is not None:
+        return bot_process.poll() is None
+    if bot_pid is None:
+        return False
+    if os.name == "nt":
+        return False
+    try:
+        cmdline = Path(f"/proc/{bot_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        return str(BOT_PATH) in cmdline
+    except (OSError, ValueError):
+        return False
+
+
+def find_existing_bot_pid() -> int | None:
+    """Find a detached strategy process so a dashboard restart can reattach safely."""
+    if os.name == "nt":
+        return None
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            if str(BOT_PATH) in cmdline:
+                return int(entry.name)
+        except OSError:
+            continue
+    return None
+
+
+def adopt_existing_bot() -> None:
+    """Restore dashboard control of a bot that outlived a dashboard restart."""
+    global bot_pid, strategy_requested_running, strategy_environment
+    global active_timeframe, active_segment, selected_timeframe, selected_segment
+    existing_pid = find_existing_bot_pid()
+    if existing_pid is None:
+        return
+    bot_pid = existing_pid
+    strategy_requested_running = True
+    strategy_environment = os.environ.copy()
+    active_timeframe = selected_timeframe = strategy_environment.get("TIMEFRAME", "1m").strip().lower()
+    active_segment = selected_segment = strategy_environment.get(
+        "TRADE_SYMBOLS", selected_segment
+    ).strip().upper()
+    log.warning("Reattached to existing strategy process PID %d after dashboard restart", existing_pid)
 
 
 def read_bot_status() -> tuple[str, str]:
@@ -314,8 +376,9 @@ def read_bot_status() -> tuple[str, str]:
 
 
 def launch_bot(environment: dict[str, str]) -> subprocess.Popen[str]:
+    global bot_pid
     with LOG_PATH.open("a", encoding="utf-8") as log_file:
-        return subprocess.Popen(
+        process = subprocess.Popen(
             [sys.executable, "-u", str(BOT_PATH)],
             cwd=str(ROOT),
             env=environment,
@@ -323,11 +386,13 @@ def launch_bot(environment: dict[str, str]) -> subprocess.Popen[str]:
             stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
+    bot_pid = process.pid
+    return process
 
 
 def bot_watchdog() -> None:
     """Restart an unexpectedly exited bot until the dashboard Stop button is used."""
-    global bot_process, restart_delay_seconds, restart_at, last_bot_launch_at, last_error
+    global bot_process, bot_pid, restart_delay_seconds, restart_at, last_bot_launch_at, last_error
     while True:
         time.sleep(1)
         with state_lock:
@@ -336,10 +401,11 @@ def bot_watchdog() -> None:
             now = time.monotonic()
             if process_is_running():
                 continue
-            if bot_process is not None:
-                exit_code = bot_process.returncode
+            if bot_process is not None or bot_pid is not None:
+                exit_code = bot_process.returncode if bot_process is not None else "unknown"
                 runtime = now - last_bot_launch_at
                 bot_process = None
+                bot_pid = None
                 restart_delay_seconds = 5 if runtime >= 60 else min(max(restart_delay_seconds * 2, 5), 60)
                 restart_at = now + restart_delay_seconds
                 last_error = f"Bot process exited with code {exit_code}; restarting automatically."
@@ -440,14 +506,16 @@ def index():
     return PAGE
 
 
-@app.get("/api/status")
-def status():
+def build_status_snapshot() -> dict[str, Any]:
     global last_error
     with state_lock:
         process_alive = process_is_running()
         running = strategy_requested_running or process_alive
         bot_health, bot_message = read_bot_status()
-        if running and not process_alive:
+        if stopping_requested and process_alive:
+            bot_health = "STOPPING"
+            bot_message = "Cancelling pending bot orders; open positions remain open."
+        elif running and not process_alive:
             bot_health = "RESTARTING"
             bot_message = last_error or "Bot process exited; waiting for automatic restart."
         elif running and bot_health == "STOPPED":
@@ -532,7 +600,7 @@ def status():
     else:
         public_ip, public_ip_error = get_public_ip()
 
-    return jsonify({
+    return {
         "running": running,
         "process_alive": process_alive,
         "bot_health": bot_health,
@@ -548,7 +616,66 @@ def status():
         "activity": read_recent_activity(),
         "last_error": last_error,
         "supported_timeframes": list(SUPPORTED_TIMEFRAMES),
-    })
+    }
+
+
+def refresh_status_cache() -> None:
+    """Fetch slow Delta account data off the request path for a responsive UI."""
+    global status_snapshot
+    while True:
+        try:
+            snapshot = build_status_snapshot()
+            with status_snapshot_lock:
+                status_snapshot = snapshot
+        except Exception:
+            log.exception("Could not refresh dashboard status snapshot")
+        time.sleep(2)
+
+
+@app.get("/api/status")
+def status():
+    with status_snapshot_lock:
+        snapshot = dict(status_snapshot) if status_snapshot is not None else {
+            "running": strategy_requested_running or process_is_running(),
+            "process_alive": process_is_running(),
+            "bot_health": "STARTING" if strategy_requested_running else "STOPPED",
+            "bot_message": "Loading the latest Delta account data.",
+            "timeframe": active_timeframe or selected_timeframe,
+            "segment": active_segment or selected_segment,
+            "sizes": selected_sizes,
+            "live_enabled": LIVE_TRADING,
+            "positions": [],
+            "positions_error": "Loading live data from Delta…",
+            "public_ip": None,
+            "public_ip_error": None,
+            "activity": read_recent_activity(),
+            "last_error": last_error,
+            "supported_timeframes": list(SUPPORTED_TIMEFRAMES),
+        }
+    with state_lock:
+        process_alive = process_is_running()
+        running = strategy_requested_running or process_alive
+        snapshot.update(
+            running=running,
+            process_alive=process_alive,
+            timeframe=active_timeframe if running and active_timeframe else selected_timeframe,
+            segment=active_segment if running and active_segment else selected_segment,
+            sizes=selected_sizes,
+            live_enabled=LIVE_TRADING,
+        )
+        if stopping_requested and process_alive:
+            snapshot.update(
+                bot_health="STOPPING",
+                bot_message="Cancelling pending bot orders; open positions remain open.",
+            )
+        elif running and not process_alive:
+            snapshot.update(
+                bot_health="RESTARTING",
+                bot_message=last_error or "Bot process exited; waiting for automatic restart.",
+            )
+        elif not running:
+            snapshot.update(bot_health="STOPPED", bot_message="Stopped by request.")
+    return jsonify(snapshot)
 
 
 @app.post("/api/timeframe")
@@ -594,8 +721,8 @@ def set_settings():
 
 @app.post("/api/start")
 def start():
-    global bot_process, active_timeframe, active_segment, selected_timeframe, selected_segment, selected_sizes, last_error
-    global strategy_requested_running, strategy_environment, restart_delay_seconds, restart_at, last_bot_launch_at
+    global bot_process, bot_pid, active_timeframe, active_segment, selected_timeframe, selected_segment, selected_sizes, last_error
+    global strategy_requested_running, strategy_environment, restart_delay_seconds, restart_at, last_bot_launch_at, stopping_requested
     if not LIVE_TRADING:
         return jsonify(error="Live trading is disabled. Set ENABLE_LIVE_TRADING=true in .env, then restart the dashboard."), 409
     body = request.get_json(silent=True) or {}
@@ -630,6 +757,7 @@ def start():
             strategy_environment = env.copy()
             bot_process = launch_bot(strategy_environment)
             strategy_requested_running = True
+            stopping_requested = False
             restart_delay_seconds = 5
             restart_at = 0.0
             last_bot_launch_at = time.monotonic()
@@ -642,6 +770,7 @@ def start():
             last_error = None
         except OSError as exc:
             bot_process = None
+            bot_pid = None
             strategy_requested_running = False
             strategy_environment = None
             return jsonify(error=f"Could not launch strategy: {exc}"), 500
@@ -650,7 +779,7 @@ def start():
 
 @app.post("/api/stop")
 def stop():
-    global bot_process, active_timeframe, active_segment, last_error
+    global bot_process, bot_pid, active_timeframe, active_segment, last_error, stopping_requested
     global strategy_requested_running, strategy_environment, restart_at
     with state_lock:
         was_requested = strategy_requested_running
@@ -659,28 +788,57 @@ def stop():
         restart_at = 0.0
         if not process_is_running():
             bot_process = None
+            bot_pid = None
             active_timeframe = None
             active_segment = None
             last_error = None
-            return jsonify(ok=True, stopped=was_requested)
-        assert bot_process is not None
-        if os.name == "nt":
-            bot_process.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            bot_process.terminate()
+            stopping_requested = False
+            return jsonify(ok=True, stopped=was_requested, stopping=False)
+        process = bot_process
+        pid = bot_pid
         try:
-            bot_process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            bot_process.kill()
-            bot_process.wait(timeout=5)
-        bot_process = None
-        active_timeframe = None
-        active_segment = None
-        last_error = None
-    return jsonify(ok=True, stopped=True, positions_left_open=True)
+            if process is not None:
+                process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
+            elif pid is not None:
+                os.kill(pid, signal.SIGTERM)
+            else:
+                return jsonify(error="The strategy process could not be located safely."), 409
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            return jsonify(error=f"Could not signal the strategy process: {exc}"), 500
+        stopping_requested = True
+
+    threading.Thread(
+        target=finish_stop,
+        args=(process, pid),
+        name="strategy-stop-cleanup",
+        daemon=True,
+    ).start()
+    return jsonify(ok=True, stopping=True, positions_left_open=True)
+
+
+def finish_stop(process: subprocess.Popen[str] | None, pid: int | None) -> None:
+    """Wait for graceful order cancellation without holding up the Stop request."""
+    global bot_process, bot_pid, active_timeframe, active_segment, last_error, stopping_requested
+    if process is not None:
+        process.wait()
+    else:
+        while pid is not None and process_is_running():
+            time.sleep(0.5)
+    with state_lock:
+        if pid is None or bot_pid == pid:
+            bot_process = None
+            bot_pid = None
+            active_timeframe = None
+            active_segment = None
+            last_error = None
+            stopping_requested = False
 
 
 if __name__ == "__main__":
     print(f"Dashboard listening locally at http://{HOST}:{PORT}")
+    adopt_existing_bot()
     threading.Thread(target=bot_watchdog, name="strategy-watchdog", daemon=True).start()
+    threading.Thread(target=refresh_status_cache, name="delta-status-cache", daemon=True).start()
     app.run(host=HOST, port=PORT, debug=False, threaded=True, use_reloader=False)

@@ -682,12 +682,16 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
     finally:
         if LIVE_TRADING:
-            for contract in contracts:
+            def cancel_contract_orders(contract: Contract) -> None:
                 try:
                     for order in get_strategy_open_orders(product_ids[contract.symbol]):
                         cancel_order(product_ids[contract.symbol], order)
                 except Exception:
                     log.exception("Could not cancel pending strategy orders for %s during shutdown", contract.symbol)
+
+            if contracts:
+                with ThreadPoolExecutor(max_workers=min(6, len(contracts))) as pool:
+                    list(pool.map(cancel_contract_orders, contracts))
         report_status("STOPPED", "Stopped by request; open positions were left as-is")
         log.info("Strategy stopped; open positions were left as-is")
 
