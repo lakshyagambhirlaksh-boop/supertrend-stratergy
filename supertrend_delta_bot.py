@@ -326,6 +326,9 @@ def get_mark_price_decimal(symbol: str) -> Decimal:
 def emergency_stop_price(symbol: str, position: int, supertrend: Any) -> Decimal:
     tick_size = get_product_tick_size(symbol)
     line = Decimal(str(supertrend))
+    # The requested tighter stop sits above the green line for longs and below
+    # the red line for shorts. If that threshold is already past the live mark,
+    # reconcile_emergency_stop re-anchors a valid stop without market-closing.
     factor = Decimal("1") + EMERGENCY_STOP_OFFSET if position > 0 else Decimal("1") - EMERGENCY_STOP_OFFSET
     raw_price = line * factor
     rounding = ROUND_CEILING if position > 0 else ROUND_FLOOR
@@ -637,21 +640,20 @@ def reconcile_emergency_stop(
 
     target = emergency_stop_price(symbol, position, supertrend)
     mark_price = get_mark_price_decimal(symbol)
-    already_triggered = target >= mark_price if position > 0 else target <= mark_price
-    if already_triggered:
-        log.warning("%s emergency stop threshold %s is already crossed at mark %s; closing position at market",
+    target_was_crossed = target >= mark_price if position > 0 else target <= mark_price
+    if target_was_crossed:
+        # Never market-close a position just because the bot has restarted or
+        # the SuperTrend line moved across the mark. Re-anchor a valid
+        # exchange-side backstop 0.6% beyond the current mark instead.
+        tick_size = get_product_tick_size(symbol)
+        fallback = mark_price * (
+            Decimal("1") - EMERGENCY_STOP_OFFSET if position > 0
+            else Decimal("1") + EMERGENCY_STOP_OFFSET
+        )
+        rounding = ROUND_FLOOR if position > 0 else ROUND_CEILING
+        target = (fallback / tick_size).to_integral_value(rounding=rounding) * tick_size
+        log.warning("%s SuperTrend stop was already past the mark; setting a valid 0.6%% backstop at %s (mark %s)",
                     symbol, target, mark_price)
-        for order in bot_orders:
-            if str(order.get("client_order_id", "")).startswith("stbot-"):
-                cancel_order(product_id, order)
-        for order in active_stops:
-            cancel_emergency_stop(product_id, order)
-        EMERGENCY_STATE["orders"].pop(symbol, None)
-        EMERGENCY_STATE["paused"][symbol] = position_direction
-        save_emergency_state()
-        place_market_order(symbol, abs(position), side, reduce_only=True)
-        log_trade_event(f"{symbol.removesuffix('USD')} emergency stop closed at market; entry paused until SuperTrend changes")
-        return True
 
     if matching_stop:
         old_price = Decimal(str(matching_stop.get("stop_price", target)))
