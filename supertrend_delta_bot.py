@@ -44,9 +44,15 @@ CANDLE_LIMIT = 500
 POLL_SECONDS = 2
 MAKER_TIMEOUT_SECONDS = 12
 MAKER_REPRICE_SECONDS = (2, 4, 6, 8, 10)
+SUPERTREND_STOP_OFFSET = Decimal("0.006")
+STOP_ORDER_DELAY_SECONDS = 10
 PRODUCT_TICK_SIZES: dict[str, Decimal] = {}
 STOP_REQUESTED = False
 ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
+STOP_POSITION_SIGNS: dict[str, int] = {}
+STOP_FIRST_SEEN_AT: dict[str, float] = {}
+STOP_ACTIVE_ORDER_IDS: dict[str, str] = {}
+STOP_REENTRY_AFTER_CANDLE: dict[str, int] = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -267,11 +273,141 @@ def get_strategy_open_orders(product_id: int) -> list[dict[str, Any]]:
     return [order for order in orders if str(order.get("client_order_id", "")).startswith("stbot-")]
 
 
+def get_strategy_open_stop_orders(product_id: int) -> list[dict[str, Any]]:
+    """Return only this bot's independent SuperTrend stop orders."""
+    if not LIVE_TRADING:
+        return []
+    data = signed_request("GET", "/v2/orders", {"product_ids": product_id, "states": "open,pending"})
+    orders = data.get("result", [])
+    return [order for order in orders
+            if str(order.get("client_order_id", "")).startswith("stsl-")
+            and order.get("stop_order_type") == "stop_loss_order"]
+
+
 def cancel_order(product_id: int, order: dict[str, Any]) -> None:
     if not LIVE_TRADING:
         return
     signed_request("DELETE", "/v2/orders", body_obj={"id": order["id"], "product_id": product_id})
-    log.info("Cancelled stale maker order %s for %s", order.get("id"), order.get("product_symbol"))
+    log.info("Cancelled strategy order %s for %s", order.get("id"), order.get("product_symbol"))
+
+
+def supertrend_stop_price(symbol: str, direction: int, supertrend: float) -> str:
+    """Place the stop 0.6% beyond the SuperTrend, rounded away from the market."""
+    tick = get_product_tick_size(symbol)
+    level = Decimal(str(supertrend))
+    raw_price = level * (Decimal("1") - SUPERTREND_STOP_OFFSET
+                         if direction == 1 else Decimal("1") + SUPERTREND_STOP_OFFSET)
+    ticks = raw_price / tick
+    rounded_ticks = ticks.to_integral_value(rounding=ROUND_FLOOR if direction == 1 else ROUND_CEILING)
+    return format(rounded_ticks * tick, "f")
+
+
+def place_supertrend_stop(
+    contract: Contract, product_id: int, position: int, stop_price: str
+) -> str | None:
+    side = "sell" if position > 0 else "buy"
+    payload = {
+        "product_id": product_id,
+        "size": abs(position),
+        "side": side,
+        "order_type": "market_order",
+        "stop_order_type": "stop_loss_order",
+        "stop_price": stop_price,
+        "stop_trigger_method": "mark_price",
+        "reduce_only": True,
+        "time_in_force": "gtc",
+        "client_order_id": f"stsl-{contract.symbol}-{int(time.time())}-{uuid.uuid4().hex[:5]}",
+    }
+    data = signed_request("POST", "/v2/orders", body_obj=payload)
+    result = data.get("result", data)
+    log.warning("Placed separate reduce-only SuperTrend stop id=%s %s %s lots=%d at %s (0.6%% offset)",
+                result.get("id"), contract.symbol, side, abs(position), stop_price)
+    return str(result["id"]) if result.get("id") is not None else None
+
+
+def sync_supertrend_stop(
+    contract: Contract, product_id: int, position: int, direction: int,
+    supertrend: float, candle_time: int,
+) -> None:
+    """Place a separate stop 10 seconds after fill; then only tighten it."""
+    if not LIVE_TRADING:
+        return
+    stops = get_strategy_open_stop_orders(product_id)
+    if position == 0:
+        STOP_POSITION_SIGNS.pop(contract.symbol, None)
+        STOP_FIRST_SEEN_AT.pop(contract.symbol, None)
+        previous_stop_id = STOP_ACTIVE_ORDER_IDS.pop(contract.symbol, None)
+        if previous_stop_id:
+            try:
+                data = signed_request("GET", f"/v2/orders/{previous_stop_id}")
+                finished_stop = data.get("result") or {}
+                if (finished_stop.get("state") == "closed"
+                        and finished_stop.get("stop_order_type") == "stop_loss_order"):
+                    interval = SUPPORTED_TIMEFRAMES[TIMEFRAME]
+                    STOP_REENTRY_AFTER_CANDLE[contract.symbol] = candle_time + 2 * interval
+                    log.warning("%s protective stop filled; waiting for the next full %s candle before entry",
+                                contract.symbol, TIMEFRAME)
+            except Exception as exc:
+                log.warning("Could not confirm final state of %s stop order %s: %s",
+                            contract.symbol, previous_stop_id, exc)
+        for order in stops:
+            cancel_order(product_id, order)
+        return
+
+    position_sign = 1 if position > 0 else -1
+    if STOP_POSITION_SIGNS.get(contract.symbol) != position_sign:
+        STOP_POSITION_SIGNS[contract.symbol] = position_sign
+        STOP_FIRST_SEEN_AT[contract.symbol] = time.monotonic()
+
+    expected_side = "sell" if position > 0 else "buy"
+    matching = [order for order in stops
+                if order.get("side") == expected_side and bool(order.get("reduce_only"))]
+    keep = matching[0] if matching else None
+    for order in stops:
+        if keep is None or order.get("id") != keep.get("id"):
+            cancel_order(product_id, order)
+    if keep is not None and keep.get("id") is not None:
+        STOP_ACTIVE_ORDER_IDS[contract.symbol] = str(keep["id"])
+
+    # During a SuperTrend reversal, the existing position is being closed by the
+    # strategy. Keep its last valid protective stop until it closes; the newly
+    # flipped SuperTrend lies on the wrong side for calculating this position's stop.
+    if direction != (1 if position > 0 else -1):
+        return
+
+    desired_price = supertrend_stop_price(contract.symbol, direction, supertrend)
+    if keep is None:
+        first_seen = STOP_FIRST_SEEN_AT.setdefault(contract.symbol, time.monotonic())
+        elapsed = time.monotonic() - first_seen
+        if elapsed < STOP_ORDER_DELAY_SECONDS:
+            return
+        order_id = place_supertrend_stop(contract, product_id, position, desired_price)
+        if order_id:
+            STOP_ACTIVE_ORDER_IDS[contract.symbol] = order_id
+        STOP_FIRST_SEEN_AT.pop(contract.symbol, None)
+        return
+
+    STOP_FIRST_SEEN_AT.pop(contract.symbol, None)
+
+    try:
+        current_price = Decimal(str(keep.get("stop_price")))
+        target_price = Decimal(desired_price)
+    except Exception:
+        current_price = Decimal("0")
+        target_price = Decimal(desired_price)
+
+    # A long stop can only rise; a short stop can only fall. Never widen risk.
+    should_tighten = target_price > current_price if position > 0 else target_price < current_price
+    current_size = int(keep.get("size", keep.get("unfilled_size", 0)) or 0)
+    if should_tighten or current_size != abs(position):
+        signed_request("PUT", "/v2/orders", body_obj={
+            "id": keep["id"],
+            "product_id": product_id,
+            "size": abs(position),
+            "stop_price": desired_price if should_tighten else str(current_price),
+        })
+        log.info("Updated SuperTrend stop for %s to %s (%d lots)",
+                 contract.symbol, desired_price if should_tighten else current_price, abs(position))
 
 
 def reprice_post_only_order(product_id: int, symbol: str, order: dict[str, Any]) -> None:
@@ -476,10 +612,13 @@ def market_fallback_for_reversal(
         place_market_order(contract.symbol, remaining_lots, open_side)
 
 
-def reconcile_position(contract: Contract, product_id: int, direction: int) -> None:
+def reconcile_position(
+    contract: Contract, product_id: int, direction: int, supertrend: float, candle_time: int
+) -> None:
     """Reconcile positions; submit close/open limits together on a trend reversal."""
     desired_sign = 1 if direction == 1 else -1
     current = get_position(product_id) if LIVE_TRADING else PAPER_POSITIONS.get(contract.symbol, 0)
+    sync_supertrend_stop(contract, product_id, current, direction, supertrend, candle_time)
     previous = LAST_KNOWN_POSITIONS.setdefault(contract.symbol, current)
     if current != previous:
         instrument = contract.symbol.removesuffix("USD")
@@ -498,6 +637,15 @@ def reconcile_position(contract: Contract, product_id: int, direction: int) -> N
             log_trade_event(f"{instrument} {position_side} size changed to {abs(current)} lots while SuperTrend was {trend}")
         LAST_KNOWN_POSITIONS[contract.symbol] = current
     existing_orders = get_strategy_open_orders(product_id)
+    cooldown_candle = STOP_REENTRY_AFTER_CANDLE.get(contract.symbol)
+    if current == 0 and cooldown_candle is not None:
+        # Clear any still-pending entry/reversal makers so none can re-enter
+        # before the cooldown candle has fully closed.
+        for order in existing_orders:
+            cancel_order(product_id, order)
+        if candle_time < cooldown_candle:
+            return
+        STOP_REENTRY_AFTER_CANDLE.pop(contract.symbol, None)
     active_order_keys = {
         str(order.get("id") or order.get("client_order_id") or "")
         for order in existing_orders
@@ -658,7 +806,8 @@ def main() -> None:
                     candle_time = int(latest["time"])
                     # Reconcile each poll so maker-order fills and open orders are
                     # tracked; only emit the candle summary once per completed bar.
-                    reconcile_position(contract, product_ids[contract.symbol], int(latest["direction"]))
+                    reconcile_position(contract, product_ids[contract.symbol],
+                                       int(latest["direction"]), float(latest["supertrend"]), candle_time)
                     had_error = contract.symbol in retry_delay
                     retry_delay.pop(contract.symbol, None)
                     retry_after.pop(contract.symbol, None)
