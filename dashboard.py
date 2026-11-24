@@ -245,10 +245,11 @@ async function refresh() {
     } else if (!tradeRows.length) {
       $('tradeActivity').innerHTML = '<p class="note">No Delta fills found for these segments yet.</p>';
     } else {
-      $('tradeActivity').innerHTML = `<table class="activity-table"><thead><tr><th>Time (IST)</th><th>Segment</th><th>Entry / exit</th><th>Entry price</th><th>Exit price</th><th>Realized P&amp;L</th></tr></thead><tbody>${tradeRows.map(t => {
+      $('tradeActivity').innerHTML = `<table class="activity-table"><thead><tr><th>Time (IST)</th><th>Segment</th><th>Entry</th><th>Side</th><th>Entry price</th><th>Exit price</th><th>Realized P&amp;L</th></tr></thead><tbody>${tradeRows.map(t => {
         const isExit = String(t.event).includes('EXIT') || String(t.event).includes('CLOSE');
+        const side = String(t.event).includes('LONG') ? 'LONG' : String(t.event).includes('SHORT') ? 'SHORT' : '—';
         const pnl = t.realized_pnl === null || t.realized_pnl === undefined ? '—' : formatActivityPnl(t.realized_pnl, t.currency);
-        return `<tr><td>${escapeHtml(t.time)}</td><td>${escapeHtml(t.symbol)}</td><td class="${isExit ? 'activity-exit' : 'activity-entry'}">${escapeHtml(t.event)}</td><td>${t.entry_price == null ? '—' : formatPrice(t.entry_price)}</td><td>${t.exit_price == null ? '—' : formatPrice(t.exit_price)}</td><td>${escapeHtml(pnl)}</td></tr>`;
+        return `<tr><td>${escapeHtml(t.time)}</td><td>${escapeHtml(t.symbol)}</td><td class="${isExit ? 'activity-exit' : 'activity-entry'}">${isExit ? 'CLOSE' : 'OPEN'}</td><td>${side}</td><td>${t.entry_price == null ? '—' : formatPrice(t.entry_price)}</td><td>${t.exit_price == null ? '—' : formatPrice(t.exit_price)}</td><td>${escapeHtml(pnl)}</td></tr>`;
       }).join('')}</tbody></table>`;
     }
   } catch (e) { $('status').textContent = 'Dashboard connection error'; $('status').className='state error'; }
