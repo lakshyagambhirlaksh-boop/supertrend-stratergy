@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,10 @@ product_id_cache: dict[str, int] = {}
 product_id_cache_lock = threading.Lock()
 status_snapshot_lock = threading.Lock()
 status_snapshot: dict[str, Any] | None = None
+trade_activity_lock = threading.Lock()
+trade_activity_cache: dict[str, Any] = {"checked_at": 0.0, "rows": [], "error": None}
+TRADE_ACTIVITY_CACHE_SECONDS = 10
+TRADE_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 
 def get_dashboard_product_ids(symbols: tuple[str, ...]) -> dict[str, int]:
@@ -133,7 +138,12 @@ PAGE = r'''<!doctype html>
     .start { background:#078b60; border-color:#078b60; color:white; } .stop { background:#c62848; border-color:#c62848; color:white; margin-left:8px; }
     .trade-row { display:flex; justify-content:space-between; padding:12px 0; border-bottom:1px solid var(--line); } .trade-row:last-child { border:0; }
     .chip { border-radius:999px; padding:3px 10px; font-size:12px; font-weight:700; } .long { color:#075d40; background:#c7f3df; } .short { color:#971b35; background:#ffd7e1; } .flat { color:#5b5260; background:#e9e0e8; }
-    .note { color:var(--muted); font-size:13px; margin:12px 0 0; } .activity-line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:10px; color:#40283a; font-size:14px; }
+    .note { color:var(--muted); font-size:13px; margin:12px 0 0; }
+    .activity-table-wrap { overflow-x:auto; margin-top:10px; }
+    .activity-table { width:100%; min-width:720px; border-collapse:collapse; font-size:13px; }
+    .activity-table th,.activity-table td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    .activity-table th { color:var(--muted); font-weight:650; }
+    .activity-entry { color:#087a53; font-weight:700; } .activity-exit { color:#b12d4b; font-weight:700; }
     @media(max-width:650px) { .grid { grid-template-columns:1fr; } .wide,.connection-card { grid-column:auto; } .connection-grid { grid-template-columns:1fr; } .topbar { align-items:flex-start; flex-direction:column; } .api-badge { text-align:left; } }
   </style>
 </head>
@@ -178,8 +188,9 @@ PAGE = r'''<!doctype html>
       <p class="note">If your Delta API key has an IP whitelist, add this public IP address there.</p>
     </section>
     <section class="card wide">
-      <div class="label">Recent bot activity</div>
-      <div id="logs" class="activity-line">No trade activity yet.</div>
+      <div class="label">Recent trade activity</div>
+      <p class="note">Latest Delta fills for the supported segments.</p>
+      <div id="tradeActivity" class="activity-table-wrap">Loading trade historyâ€¦</div>
     </section>
   </div>
 </main>
@@ -228,14 +239,25 @@ async function refresh() {
     $('apiConnection').className = `connection-value ${d.positions_error ? 'error' : 'on'}`;
     $('publicIp').textContent = d.public_ip || 'Unavailable';
     $('publicIp').className = `connection-value ${d.public_ip ? '' : 'error'}`;
-    $('logs').textContent = d.activity || 'No trade activity yet.';
-    $('logs').title = $('logs').textContent;
+    const tradeRows = d.trade_activity || [];
+    if (d.trade_activity_error) {
+      $('tradeActivity').innerHTML = `<p class="error">Could not read Delta fills: ${escapeHtml(d.trade_activity_error)}</p>`;
+    } else if (!tradeRows.length) {
+      $('tradeActivity').innerHTML = '<p class="note">No Delta fills found for these segments yet.</p>';
+    } else {
+      $('tradeActivity').innerHTML = `<table class="activity-table"><thead><tr><th>Time (IST)</th><th>Segment</th><th>Entry / exit</th><th>Entry price</th><th>Exit price</th><th>Realized P&amp;L</th></tr></thead><tbody>${tradeRows.map(t => {
+        const isExit = String(t.event).includes('EXIT') || String(t.event).includes('CLOSE');
+        const pnl = t.realized_pnl === null || t.realized_pnl === undefined ? '—' : formatActivityPnl(t.realized_pnl, t.currency);
+        return `<tr><td>${escapeHtml(t.time)}</td><td>${escapeHtml(t.symbol)}</td><td class="${isExit ? 'activity-exit' : 'activity-entry'}">${escapeHtml(t.event)}</td><td>${t.entry_price == null ? '—' : formatPrice(t.entry_price)}</td><td>${t.exit_price == null ? '—' : formatPrice(t.exit_price)}</td><td>${escapeHtml(pnl)}</td></tr>`;
+      }).join('')}</tbody></table>`;
+    }
   } catch (e) { $('status').textContent = 'Dashboard connection error'; $('status').className='state error'; }
   finally { refreshing = false; }
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function formatPrice(value) { const price = Number(value); return Number.isFinite(price) ? price.toFixed(2) : 'unavailable'; }
 function formatPnl(value) { const pnl = Number(value); return Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : 'unavailable'; }
+function formatActivityPnl(value, currency) { const pnl = Number(value); return Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} ${currency || 'USD'}` : '—'; }
 function selectedSymbols() {
   return ['ETHUSD','SOLUSD','BNBUSD','SNDKBUSD','SOXLBUSD','MVLLBUSD'].filter(symbol =>
     document.querySelector(`.segment-check[value="${symbol}"]`).checked);
@@ -424,20 +446,130 @@ def bot_watchdog() -> None:
                 log.exception("%s Retrying in %d seconds.", last_error, restart_delay_seconds)
 
 
-def read_recent_activity() -> str:
-    if not LOG_PATH.exists():
-        return ""
+def parse_fill_time(value: Any) -> tuple[float, str]:
+    """Return a sortable timestamp and readable India time for a Delta fill."""
     try:
-        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-        for line in reversed(lines):
-            marker = "TRADE_EVENT|"
-            if marker in line:
-                event = line.split(marker, 1)[1].split("|", 1)
-                if len(event) == 2:
-                    return f"{event[0]} — {event[1]}"
-        return ""
-    except OSError as exc:
-        return f"Could not read trade activity: {exc}"
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            raw = float(value)
+            seconds = raw / 1_000_000 if raw > 10_000_000_000_000 else raw / 1_000 if raw > 10_000_000_000 else raw
+            moment = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        else:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.astimezone(TRADE_TIMEZONE)
+        return moment.timestamp(), moment.strftime("%d-%b %H:%M:%S")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return 0.0, "—"
+
+
+def summarize_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn Delta fills into entry/exit rows using the position snapshot on each fill."""
+    ordered = sorted(fills, key=lambda fill: parse_fill_time(fill.get("created_at"))[0])
+    states: dict[str, dict[str, Any]] = {}
+    activity: list[dict[str, Any]] = []
+    for fill in ordered:
+        symbol = str(fill.get("product_symbol") or (fill.get("product") or {}).get("symbol") or "")
+        if not symbol:
+            continue
+        side = str(fill.get("side", "")).lower()
+        try:
+            fill_size = abs(int(float(fill.get("size", 0))))
+            fill_price = float(fill.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if side not in {"buy", "sell"} or fill_size <= 0:
+            continue
+
+        signed_fill = fill_size if side == "buy" else -fill_size
+        metadata = fill.get("meta_data") or {}
+        new_position = metadata.get("new_position") or {}
+        prior_state = states.get(symbol, {"size": 0, "entry_price": None, "realized_pnl": None})
+        try:
+            new_size = int(new_position.get("size")) if new_position.get("size") is not None else int(prior_state["size"]) + signed_fill
+        except (TypeError, ValueError):
+            new_size = int(prior_state["size"]) + signed_fill
+        prior_size = new_size - signed_fill
+        if prior_state["size"] != 0:
+            prior_size = int(prior_state["size"])
+
+        entry_price = prior_state.get("entry_price")
+        reported_entry = new_position.get("entry_price")
+        try:
+            reported_entry = float(reported_entry) if reported_entry not in (None, "") else None
+        except (TypeError, ValueError):
+            reported_entry = None
+        new_sign = 1 if new_size > 0 else -1 if new_size < 0 else 0
+        old_sign = 1 if prior_size > 0 else -1 if prior_size < 0 else 0
+        event_epoch, event_time = parse_fill_time(fill.get("created_at"))
+        realized = new_position.get("realized_pnl")
+        try:
+            realized = float(realized) if realized not in (None, "") else None
+        except (TypeError, ValueError):
+            realized = None
+        previous_realized = prior_state.get("realized_pnl")
+        currency = str(fill.get("settling_asset_symbol") or "USD")
+
+        def add_row(event: str, entry: Any, exit_price: Any, pnl: Any = None) -> None:
+            activity.append({
+                "time": event_time,
+                "sort_time": event_epoch,
+                "symbol": symbol,
+                "event": event,
+                "entry_price": entry,
+                "exit_price": exit_price,
+                "realized_pnl": pnl,
+                "currency": currency,
+            })
+
+        if old_sign == 0 and new_sign != 0:
+            entry_price = reported_entry or fill_price
+            add_row("LONG ENTRY" if new_sign > 0 else "SHORT ENTRY", entry_price, None)
+        elif old_sign == new_sign and abs(new_size) > abs(prior_size):
+            entry_price = reported_entry or entry_price or fill_price
+            add_row("ADD LONG" if new_sign > 0 else "ADD SHORT", entry_price, None)
+        elif old_sign != 0 and (new_sign == 0 or old_sign != new_sign or abs(new_size) < abs(prior_size)):
+            entry_price = entry_price or reported_entry
+            event = "EXIT LONG" if old_sign > 0 else "EXIT SHORT"
+            if new_sign != 0 and new_sign != old_sign:
+                event = "REVERSE: CLOSE LONG" if old_sign > 0 else "REVERSE: CLOSE SHORT"
+            fill_realized = realized
+            if realized is not None and previous_realized is not None and new_sign == old_sign:
+                fill_realized = realized - float(previous_realized)
+            add_row(event, entry_price, fill_price, fill_realized)
+            if new_sign != 0 and new_sign != old_sign:
+                entry_price = reported_entry or fill_price
+                add_row("OPEN LONG" if new_sign > 0 else "OPEN SHORT", entry_price, None)
+        else:
+            entry_price = reported_entry or entry_price
+
+        states[symbol] = {
+            "size": new_size,
+            "entry_price": entry_price if new_size != 0 else None,
+            "realized_pnl": realized if new_size != 0 else None,
+        }
+
+    return sorted(activity, key=lambda row: row["sort_time"], reverse=True)[:15]
+
+
+def get_recent_trade_activity(product_ids: dict[str, int]) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch recent account fills on the configured segments, cached between polls."""
+    now = time.monotonic()
+    with trade_activity_lock:
+        if now - trade_activity_cache["checked_at"] < TRADE_ACTIVITY_CACHE_SECONDS:
+            return list(trade_activity_cache["rows"]), trade_activity_cache["error"]
+    try:
+        payload = signed_request("GET", "/v2/fills", {
+            "product_ids": ",".join(str(value) for value in product_ids.values()),
+            "page_size": 50,
+        })
+        rows = summarize_fills(payload.get("result", []))
+        error = None
+    except Exception as exc:
+        rows, error = [], str(exc)
+    with trade_activity_lock:
+        trade_activity_cache.update(checked_at=time.monotonic(), rows=rows, error=error)
+    return list(rows), error
 
 
 def persist_settings(values: dict[str, str]) -> None:
@@ -526,6 +658,8 @@ def build_status_snapshot() -> dict[str, Any]:
 
     positions: list[dict[str, Any]] = []
     positions_error = None
+    trade_activity: list[dict[str, Any]] = []
+    trade_activity_error = None
     strategy_timeframe = active_timeframe if running and active_timeframe else selected_timeframe
     if API_KEY and API_SECRET:
         try:
@@ -533,6 +667,7 @@ def build_status_snapshot() -> dict[str, Any]:
             # Product metadata is static and was being fetched again on every
             # two-second dashboard poll. Resolve once, in parallel, then reuse.
             product_ids = get_dashboard_product_ids(symbols)
+            trade_activity, trade_activity_error = get_recent_trade_activity(product_ids)
             try:
                 margined = get_margined_positions(list(product_ids.values()))
             except Exception:
@@ -587,8 +722,11 @@ def build_status_snapshot() -> dict[str, Any]:
                 positions = list(pool.map(read_symbol, symbols))
         except Exception as exc:
             positions_error = str(exc)
+            if trade_activity_error is None:
+                trade_activity_error = str(exc)
     else:
         positions_error = "Add Delta API credentials to .env to show positions."
+        trade_activity_error = positions_error
 
     delta_client_ip = None
     if positions_error:
@@ -613,7 +751,8 @@ def build_status_snapshot() -> dict[str, Any]:
         "positions_error": positions_error,
         "public_ip": public_ip,
         "public_ip_error": public_ip_error,
-        "activity": read_recent_activity(),
+        "trade_activity": trade_activity,
+        "trade_activity_error": trade_activity_error,
         "last_error": last_error,
         "supported_timeframes": list(SUPPORTED_TIMEFRAMES),
     }
@@ -648,7 +787,8 @@ def status():
             "positions_error": "Loading live data from Delta…",
             "public_ip": None,
             "public_ip_error": None,
-            "activity": read_recent_activity(),
+            "trade_activity": [],
+            "trade_activity_error": "Loading recent fills from Delta…" if API_KEY and API_SECRET else "Add Delta API credentials to .env to show positions.",
             "last_error": last_error,
             "supported_timeframes": list(SUPPORTED_TIMEFRAMES),
         }
