@@ -39,11 +39,11 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1m").strip().lower()
 ATR_LENGTH = 15
 FACTOR = 3.0
 CANDLE_LIMIT = 500
-# Check open maker orders each second so 3s/6s repricing steps aren't delayed
-# by the dashboard's separate 2-second refresh cadence.
-POLL_SECONDS = 1
-MAKER_TIMEOUT_SECONDS = 10
-MAKER_REPRICE_SECONDS = (3, 6)
+# Check pending maker orders every 2 seconds, reprice five times, then use the
+# market fallback only after 12 seconds if any remainder is still unfilled.
+POLL_SECONDS = 2
+MAKER_TIMEOUT_SECONDS = 12
+MAKER_REPRICE_SECONDS = (2, 4, 6, 8, 10)
 PRODUCT_TICK_SIZES: dict[str, Decimal] = {}
 STOP_REQUESTED = False
 ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
@@ -305,7 +305,7 @@ def reprice_post_only_order(product_id: int, symbol: str, order: dict[str, Any])
 def manage_pending_maker_order(
     contract: Contract, product_id: int, direction: int, order: dict[str, Any]
 ) -> None:
-    """Reprice at 3s and 6s, then use the existing market fallback at 10s."""
+    """Reprice at 2, 4, 6, 8, and 10 seconds; market fallback at 12 seconds."""
     order_id = str(order.get("id") or order.get("client_order_id") or "")
     age = order_age_seconds(order)
     if age is None:
@@ -394,7 +394,7 @@ def place_market_order(symbol: str, lots: int, side: str, reduce_only: bool = Fa
     instrument = symbol.removesuffix("USD")
     trade_side = "long" if side == "buy" else "short"
     action = f"close {('long' if side == 'sell' else 'short')}" if reduce_only else f"{trade_side} market order"
-    log_trade_event(f"{instrument} {action} order placed after the 10-second maker timeout")
+    log_trade_event(f"{instrument} {action} order placed after the 12-second maker timeout")
 
 
 def order_age_seconds(order: dict[str, Any]) -> float | None:

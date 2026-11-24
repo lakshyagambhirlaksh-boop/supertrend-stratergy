@@ -302,7 +302,7 @@ def run() -> None:
             if button_cols[1].button("Stop strategy", disabled=not running, use_container_width=True):
                 _stop()
                 st.rerun()
-            st.caption("Unfilled maker orders switch to market after a fixed 10 seconds. Stop leaves open positions as-is.")
+            st.caption("Maker limits are repriced every 2 seconds and switch to market after 12 seconds if still unfilled. Stop leaves open positions as-is.")
 
     with right:
         with st.container(border=True):

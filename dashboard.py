@@ -284,7 +284,7 @@ async function startBot() {
   if (!Number.isInteger(lots) || lots < 1 || lots > 10000) { alert('Lots must be a whole number from 1 to 10000.'); return; }
   const sizes = {lots_per_segment:lots};
   const sizeText = `${lots} lots per selected segment`;
-  if (!confirm(`Start LIVE trading on ${symbols.map(s => s.replace('USD','')).join(' + ')} using ${timeframe}? Size: ${sizeText}. Unfilled maker orders switch to market after a fixed 10 seconds.`)) return;
+  if (!confirm(`Start LIVE trading on ${symbols.map(s => s.replace('USD','')).join(' + ')} using ${timeframe}? Size: ${sizeText}. Maker limits are repriced every 2 seconds and switch to market after 12 seconds if still unfilled.`)) return;
   $('status').textContent = 'RUNNING · STARTING';
   $('status').className = 'state on';
   $('live').textContent = 'Starting the strategy and connecting to Delta…';

@@ -10,7 +10,7 @@ The dashboard offers ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, SOXLBUSD, and MVLLBUSD. *
 
 Set one shared `LOTS_PER_SEGMENT` value. That many contract lots are used for every selected instrument. Each product's contract size and exposure can differ.
 
-Orders start as post-only limit orders and are repriced after 3 and 6 seconds. At 10 seconds, an unfilled remainder may fall back to a market order and incur taker fees. A reversal submits the reduce-only close and new-side entry orders in the same reconciliation cycle. Stopping the bot cancels its pending orders and leaves positions open.
+Orders start as post-only limit orders. The bot checks pending orders every 2 seconds and reprices them at 2, 4, 6, 8, and 10 seconds. At 12 seconds, an unfilled remainder may fall back to a market order and incur taker fees. A reversal submits the reduce-only close and new-side entry orders in the same reconciliation cycle. Stopping the bot cancels its pending orders and leaves positions open.
 
 ## Setup
 
