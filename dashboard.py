@@ -176,6 +176,8 @@ PAGE = r'''<!doctype html>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
           <label id="lotsField" class="label">Lots for each selected segment<br><input id="lotsPerSegment" type="number" min="1" max="10000" step="1" value="1"></label>
         </div>
+        <button id="submitLots" onclick="submitLotSize()">Submit lot size</button>
+        <p id="lotSummary" class="note">Each selected segment: 1 lot. This setting applies when you next start the strategy.</p>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
@@ -222,6 +224,7 @@ async function refresh() {
     document.querySelectorAll('.segment-check').forEach(el => el.disabled = d.running);
     $('selectAllSegments').disabled = d.running;
     $('lotsPerSegment').disabled = d.running;
+    $('submitLots').disabled = d.running;
     if (!d.running) $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
     if (d.timeframe) $('timeframe').value = d.timeframe;
     if (d.segment) {
@@ -230,6 +233,7 @@ async function refresh() {
       $('selectAllSegments').checked = active.length === 6;
       $('selectAllSegments').indeterminate = active.length > 0 && active.length < 6;
     }
+    updateLotSummary();
     updateLotVisibility();
     if (d.positions_error) $('positions').innerHTML = `<p class="error">Could not read Delta positions: ${escapeHtml(d.positions_error)}</p>`;
     else $('positions').innerHTML = d.positions.map(p => {
@@ -276,6 +280,28 @@ function selectedSymbols() {
     document.querySelector(`.segment-check[value="${symbol}"]`).checked);
 }
 function updateLotVisibility() {}
+function updateLotSummary(message) {
+  const lots = Number($('lotsPerSegment').value);
+  const count = selectedSymbols().length;
+  $('lotSummary').textContent = message || `Each selected segment: ${Number.isInteger(lots) && lots > 0 ? lots : '—'} lot${lots === 1 ? '' : 's'} (${count} segment${count === 1 ? '' : 's'} selected). This setting applies when you next start the strategy.`;
+}
+async function submitLotSize() {
+  const symbols = selectedSymbols();
+  const lots = Number($('lotsPerSegment').value);
+  if (!symbols.length) { alert('Select at least one trading segment.'); return; }
+  if (!Number.isInteger(lots) || lots < 1 || lots > 10000) { alert('Lots must be a whole number from 1 to 10000.'); return; }
+  $('submitLots').disabled = true;
+  try {
+    const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:symbols.join(','),lots_per_segment:lots})});
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || 'Could not save lot size.'); return; }
+    updateLotSummary(`Saved: ${lots} lot${lots === 1 ? '' : 's'} for each of ${symbols.length} selected segment${symbols.length === 1 ? '' : 's'}. This applies when you next start the strategy.`);
+  } catch (e) {
+    alert('Could not reach the dashboard to save the lot size.');
+  } finally {
+    $('submitLots').disabled = false;
+  }
+}
 async function startBot() {
   const timeframe = $('timeframe').value;
   const symbols = selectedSymbols();
@@ -330,14 +356,16 @@ function onSegmentCheckboxChange() {
   const count = selectedSymbols().length;
   $('selectAllSegments').checked = count === 6;
   $('selectAllSegments').indeterminate = count > 0 && count < 6;
+  updateLotSummary();
   updateLotVisibility(); saveSettings();
 }
 document.querySelectorAll('.segment-check').forEach(el => el.addEventListener('change', onSegmentCheckboxChange));
 $('selectAllSegments').addEventListener('change', () => {
   document.querySelectorAll('.segment-check').forEach(el => el.checked = $('selectAllSegments').checked);
+  updateLotSummary();
   updateLotVisibility(); saveSettings();
 });
-$("lotsPerSegment").addEventListener('change', saveSettings);
+$("lotsPerSegment").addEventListener('input', () => updateLotSummary());
 refresh(); setInterval(refresh, 2000);
 </script>
 </body></html>'''
