@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -249,7 +250,7 @@ async function refresh() {
       ? new Intl.NumberFormat('en-IN', {style:'currency', currency:'INR', minimumFractionDigits:2, maximumFractionDigits:2}).format(inrBalance)
       : 'Unavailable';
     $('accountBalance').className = `connection-value ${hasInrBalance ? '' : 'error'}`;
-    $('accountBalance').title = d.balance_error || 'Total INR wallet balance from Delta.';
+    $('accountBalance').title = d.balance_error || 'Delta USD wallet balance converted at the fixed rate of ₹85 per USD.';
     const tradeRows = d.trade_activity || [];
     if (d.trade_activity_error) {
       $('tradeActivity').innerHTML = `<p class="error">Could not read Delta fills: ${escapeHtml(d.trade_activity_error)}</p>`;
@@ -617,21 +618,31 @@ def get_public_ip() -> tuple[str | None, str | None]:
 
 
 def get_inr_account_balance() -> tuple[str | None, str | None]:
-    """Read and briefly cache the total INR wallet balance from Delta."""
+    """Read the USD wallet balance and convert it to INR at the configured fixed rate."""
     now = time.monotonic()
     with inr_balance_lock:
         if now - inr_balance_cache["checked_at"] < INR_BALANCE_CACHE_SECONDS:
             return inr_balance_cache["value"], inr_balance_cache["error"]
     try:
         payload = signed_request("GET", "/v2/wallet/balances")
-        wallet = next(
-            (item for item in payload.get("result", [])
-             if str(item.get("asset_symbol", "")).upper() == "INR"),
+        wallets = payload.get("result", [])
+        usd_wallet = next(
+            (item for item in wallets if str(item.get("asset_symbol", "")).upper() == "USD"),
             None,
         )
-        if wallet is None or wallet.get("balance") in (None, ""):
-            raise RuntimeError("Delta did not return an INR wallet balance.")
-        value, error = str(wallet["balance"]), None
+        if usd_wallet is not None and usd_wallet.get("balance") not in (None, ""):
+            usd_balance = Decimal(str(usd_wallet["balance"]))
+            value, error = format(usd_balance * Decimal("85"), "f"), None
+        else:
+            inr_wallet = next(
+                (item for item in wallets if str(item.get("asset_symbol", "")).upper() == "INR"),
+                None,
+            )
+            if inr_wallet is None or inr_wallet.get("balance") in (None, ""):
+                raise RuntimeError("Delta did not return a USD or INR wallet balance.")
+            value, error = str(inr_wallet["balance"]), None
+    except (InvalidOperation, ValueError) as exc:
+        value, error = None, f"Delta returned an invalid wallet balance: {exc}"
     except Exception as exc:
         value, error = None, str(exc)
     with inr_balance_lock:
