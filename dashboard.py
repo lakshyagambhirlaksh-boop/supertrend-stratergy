@@ -41,7 +41,7 @@ BOT_PATH = ROOT / "supertrend_delta_bot.py"
 LOG_PATH = ROOT / "strategy.log"
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8765"))
-SUPPORTED_SYMBOLS = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "SOXLBUSD", "MVLLBUSD")
+SUPPORTED_SYMBOLS = ("ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "SNDKBUSD", "SOXLBUSD", "MVLLBUSD")
 SUPPORTED_SEGMENTS = {",".join(c) for size in range(1, len(SUPPORTED_SYMBOLS) + 1) for c in combinations(SUPPORTED_SYMBOLS, size)}
 
 app = Flask(__name__)
@@ -58,10 +58,11 @@ last_bot_launch_at = 0.0
 active_timeframe: str | None = None
 active_segment: str | None = None
 selected_timeframe = os.getenv("TIMEFRAME", "1m").strip().lower()
-selected_segment = os.getenv("TRADE_SYMBOLS", "ETHUSD,SOLUSD,BNBUSD,SNDKBUSD,SOXLBUSD,MVLLBUSD").strip().upper()
+selected_segment = os.getenv("TRADE_SYMBOLS", "ETHUSD,SOLUSD,XRPUSD,BNBUSD,SNDKBUSD,SOXLBUSD,MVLLBUSD").strip().upper()
 selected_sizes = {
     "ETH_SIZE": int(os.getenv("ETH_SIZE", "1")),
     "SOL_SIZE": int(os.getenv("SOL_SIZE", "1")),
+    "XRP_SIZE": int(os.getenv("XRP_SIZE", "1")),
     "BNB_SIZE": int(os.getenv("BNB_SIZE", "1")),
     "SNDKB_SIZE": int(os.getenv("SNDKB_SIZE", "1")),
     "SOXLB_SIZE": int(os.getenv("SOXLB_SIZE", "1")),
@@ -153,7 +154,7 @@ PAGE = r'''<!doctype html>
 </head>
 <body><main>
   <div class="topbar">
-    <div><h1>Delta SuperTrend</h1><p class="sub">ETH, SOL, BNB, SNDKB and SOXL perpetuals · SuperTrend 15, factor 3 · mark-price candles</p></div>
+    <div><h1>Delta SuperTrend</h1><p class="sub">ETH, SOL, XRP, BNB, SNDKB, SOXL and MVLL perpetuals · SuperTrend 15, factor 3 · mark-price candles</p></div>
     <div class="api-badge"><div class="label">Delta API key</div><div id="apiConnection" class="connection-value">Checking…</div></div>
   </div>
   <div class="grid">
@@ -170,6 +171,7 @@ PAGE = r'''<!doctype html>
           <label><input class="segment-check" type="checkbox" value="MVLLBUSD" style="width:16px"> MVLLBUSD</label>
           <label><input class="segment-check" type="checkbox" value="ETHUSD" style="width:16px"> ETH</label>
           <label><input class="segment-check" type="checkbox" value="SOLUSD" style="width:16px"> SOL</label>
+          <label><input class="segment-check" type="checkbox" value="XRPUSD" style="width:16px"> XRP</label>
           <label><input class="segment-check" type="checkbox" value="BNBUSD" style="width:16px"> BNB</label>
           <label><input class="segment-check" type="checkbox" value="SNDKBUSD" style="width:16px"> SNDKBUSD</label>
         </div>
@@ -278,7 +280,7 @@ function formatPrice(value) { const price = Number(value); return Number.isFinit
 function formatPnl(value) { const pnl = Number(value); return Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : 'unavailable'; }
 function formatActivityPnl(value, currency) { const pnl = Number(value); return Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} ${currency || 'USD'}` : '—'; }
 function selectedSymbols() {
-  return ['ETHUSD','SOLUSD','BNBUSD','SNDKBUSD','SOXLBUSD','MVLLBUSD'].filter(symbol =>
+  return ['ETHUSD','SOLUSD','XRPUSD','BNBUSD','SNDKBUSD','SOXLBUSD','MVLLBUSD'].filter(symbol =>
     document.querySelector(`.segment-check[value="${symbol}"]`).checked);
 }
 function updateLotVisibility() {}
@@ -751,7 +753,7 @@ def build_status_snapshot() -> dict[str, Any]:
     strategy_timeframe = active_timeframe if running and active_timeframe else selected_timeframe
     if API_KEY and API_SECRET:
         try:
-            symbols = ("ETHUSD", "SOLUSD", "BNBUSD", "SNDKBUSD", "SOXLBUSD", "MVLLBUSD")
+            symbols = ("ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "SNDKBUSD", "SOXLBUSD", "MVLLBUSD")
             # Product metadata is static and was being fetched again on every
             # two-second dashboard poll. Resolve once, in parallel, then reuse.
             product_ids = get_dashboard_product_ids(symbols)
@@ -937,13 +939,13 @@ def set_settings():
     segment = str(body.get("segment", selected_segment)).upper()
     try:
         lots = int(body.get("lots_per_segment", selected_sizes["LOTS_PER_SEGMENT"]))
-        eth_size = sol_size = bnb_size = sndkb_size = soxlb_size = mvll_size = lots
+        eth_size = sol_size = xrp_size = bnb_size = sndkb_size = soxlb_size = mvll_size = lots
     except (TypeError, ValueError):
         return jsonify(error="Lot sizes must be whole numbers."), 400
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
     if segment not in SUPPORTED_SEGMENTS:
-        return jsonify(error="Choose one or more supported ETH, SOL, BNB, SNDKB, SOXLB, or MVLL segments."), 400
+        return jsonify(error="Choose one or more supported ETH, SOL, XRP, BNB, SNDKB, SOXLB, or MVLL segments."), 400
     if not (1 <= lots <= 10000):
         return jsonify(error="Lot sizes must be from 1 to 10000."), 400
     with state_lock:
@@ -951,8 +953,8 @@ def set_settings():
             return jsonify(error="Stop the strategy before changing settings."), 409
         selected_timeframe = timeframe
         selected_segment = segment
-        selected_sizes = {"ETH_SIZE": eth_size, "SOL_SIZE": sol_size, "BNB_SIZE": bnb_size, "SNDKB_SIZE": sndkb_size, "SOXLB_SIZE": soxlb_size, "MVLL_SIZE": mvll_size, "LOTS_PER_SEGMENT": lots}
-        persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "ETH_SIZE": str(eth_size), "SOL_SIZE": str(sol_size), "BNB_SIZE": str(bnb_size), "SNDKB_SIZE": str(sndkb_size), "SOXLB_SIZE": str(soxlb_size), "MVLL_SIZE": str(mvll_size), "LOTS_PER_SEGMENT": str(lots)})
+        selected_sizes = {"ETH_SIZE": eth_size, "SOL_SIZE": sol_size, "XRP_SIZE": xrp_size, "BNB_SIZE": bnb_size, "SNDKB_SIZE": sndkb_size, "SOXLB_SIZE": soxlb_size, "MVLL_SIZE": mvll_size, "LOTS_PER_SEGMENT": lots}
+        persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "ETH_SIZE": str(eth_size), "SOL_SIZE": str(sol_size), "XRP_SIZE": str(xrp_size), "BNB_SIZE": str(bnb_size), "SNDKB_SIZE": str(sndkb_size), "SOXLB_SIZE": str(soxlb_size), "MVLL_SIZE": str(mvll_size), "LOTS_PER_SEGMENT": str(lots)})
     return jsonify(ok=True, timeframe=timeframe, segment=segment, sizes=selected_sizes)
 
 
@@ -968,10 +970,10 @@ def start():
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify(error=f"Choose one of: {', '.join(SUPPORTED_TIMEFRAMES)}."), 400
     if segment not in SUPPORTED_SEGMENTS:
-        return jsonify(error="Choose one or more supported ETH, SOL, BNB, SNDKB, SOXLB, or MVLL segments."), 400
+        return jsonify(error="Choose one or more supported ETH, SOL, XRP, BNB, SNDKB, SOXLB, or MVLL segments."), 400
     try:
         lots = int(body.get("lots_per_segment", selected_sizes["LOTS_PER_SEGMENT"]))
-        eth_size = sol_size = bnb_size = sndkb_size = soxlb_size = mvll_size = lots
+        eth_size = sol_size = xrp_size = bnb_size = sndkb_size = soxlb_size = mvll_size = lots
     except (TypeError, ValueError):
         return jsonify(error="Lot sizes must be whole numbers."), 400
     if not (1 <= lots <= 10000):
@@ -985,6 +987,7 @@ def start():
         env["TRADE_SYMBOLS"] = segment
         env["ETH_SIZE"] = str(eth_size)
         env["SOL_SIZE"] = str(sol_size)
+        env["XRP_SIZE"] = str(xrp_size)
         env["BNB_SIZE"] = str(bnb_size)
         env["SNDKB_SIZE"] = str(sndkb_size)
         env["SOXLB_SIZE"] = str(soxlb_size)
@@ -1002,8 +1005,8 @@ def start():
             active_segment = segment
             selected_timeframe = timeframe
             selected_segment = segment
-            selected_sizes = {"ETH_SIZE": eth_size, "SOL_SIZE": sol_size, "BNB_SIZE": bnb_size, "SNDKB_SIZE": sndkb_size, "SOXLB_SIZE": soxlb_size, "MVLL_SIZE": mvll_size, "LOTS_PER_SEGMENT": lots}
-            persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "ETH_SIZE": str(eth_size), "SOL_SIZE": str(sol_size), "BNB_SIZE": str(bnb_size), "SNDKB_SIZE": str(sndkb_size), "SOXLB_SIZE": str(soxlb_size), "MVLL_SIZE": str(mvll_size), "LOTS_PER_SEGMENT": str(lots)})
+            selected_sizes = {"ETH_SIZE": eth_size, "SOL_SIZE": sol_size, "XRP_SIZE": xrp_size, "BNB_SIZE": bnb_size, "SNDKB_SIZE": sndkb_size, "SOXLB_SIZE": soxlb_size, "MVLL_SIZE": mvll_size, "LOTS_PER_SEGMENT": lots}
+            persist_settings({"TIMEFRAME": timeframe, "TRADE_SYMBOLS": segment, "ETH_SIZE": str(eth_size), "SOL_SIZE": str(sol_size), "XRP_SIZE": str(xrp_size), "BNB_SIZE": str(bnb_size), "SNDKB_SIZE": str(sndkb_size), "SOXLB_SIZE": str(soxlb_size), "MVLL_SIZE": str(mvll_size), "LOTS_PER_SEGMENT": str(lots)})
             last_error = None
         except OSError as exc:
             bot_process = None
@@ -1030,6 +1033,7 @@ def set_lot_size():
         selected_sizes = {
             "ETH_SIZE": lots,
             "SOL_SIZE": lots,
+            "XRP_SIZE": lots,
             "BNB_SIZE": lots,
             "SNDKB_SIZE": lots,
             "SOXLB_SIZE": lots,
@@ -1040,6 +1044,7 @@ def set_lot_size():
         persist_settings({
             "ETH_SIZE": str(lots),
             "SOL_SIZE": str(lots),
+            "XRP_SIZE": str(lots),
             "BNB_SIZE": str(lots),
             "SNDKB_SIZE": str(lots),
             "SOXLB_SIZE": str(lots),

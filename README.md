@@ -6,7 +6,7 @@ This bot trades Delta India perpetual futures using **SuperTrend (length 15, fac
 - Red SuperTrend: target a short position.
 - A color change reverses the position after the candle closes.
 
-The dashboard offers ETHUSD, SOLUSD, BNBUSD, SNDKBUSD, SOXLBUSD, and MVLLBUSD. **Select all** is on by default.
+The dashboard offers ETHUSD, SOLUSD, XRPUSD, BNBUSD, SNDKBUSD, SOXLBUSD, and MVLLBUSD. **Select all** is on by default.
 
 Set one shared `LOTS_PER_SEGMENT` value. That many contract lots are used for every selected instrument. Each product's contract size and exposure can differ.
 
@@ -27,7 +27,9 @@ python .\dashboard.py
 
 Open `http://127.0.0.1:8765`. The dashboard is bound to localhost by default. For VPS access, use an SSH tunnel rather than exposing the unauthenticated control page publicly.
 
-The dashboard saves timeframe, segment selection, and shared lot size into `.env`. It retries temporary bot errors, but trading pauses while the exchange or API is unavailable. The bot does not set an exchange stop-loss or take-profit.
+The bot places a separate reduce-only stop-market order 10 seconds after it detects an entry fill. The stop is 0.35% beyond SuperTrend and trails only to tighten as completed candles update. After a stop fills, that segment waits for one full candle before taking another entry.
+
+The dashboard saves timeframe, segment selection, and shared lot size into `.env`. It retries temporary bot errors, but trading pauses while the exchange or API is unavailable.
 
 ## Streamlit Cloud
 
