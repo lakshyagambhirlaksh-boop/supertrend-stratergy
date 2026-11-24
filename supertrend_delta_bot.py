@@ -53,6 +53,7 @@ STOP_POSITION_SIGNS: dict[str, int] = {}
 STOP_FIRST_SEEN_AT: dict[str, float] = {}
 STOP_ACTIVE_ORDER_IDS: dict[str, str] = {}
 STOP_REENTRY_AFTER_CANDLE: dict[str, int] = {}
+ORDER_KEYS_BY_SYMBOL: dict[str, set[str]] = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -260,10 +261,22 @@ def get_best_quote(symbol: str, side: str) -> str:
     data = _check_response(response)
     ticker = data.get("result") or {}
     quotes = ticker.get("quotes") or {}
-    quote = quotes.get("best_bid" if side == "buy" else "best_ask")
-    if quote is None:
-        raise RuntimeError(f"Delta returned no passive quote for {symbol} {side}")
-    return str(quote)
+    best_bid = quotes.get("best_bid")
+    best_ask = quotes.get("best_ask")
+    if best_bid is None or best_ask is None:
+        raise RuntimeError(f"Delta returned incomplete bid/ask quotes for {symbol}")
+    tick = get_product_tick_size(symbol)
+    bid_ticks = (Decimal(str(best_bid)) / tick).to_integral_value(rounding=ROUND_FLOOR)
+    ask_ticks = (Decimal(str(best_ask)) / tick).to_integral_value(rounding=ROUND_CEILING)
+    if side == "buy":
+        # Keep the buy at or below the bid, and at least one tick below the ask.
+        price_ticks = min(bid_ticks, ask_ticks - 1)
+    else:
+        # Keep the sell at or above the ask, and at least one tick above the bid.
+        price_ticks = max(ask_ticks, bid_ticks + 1)
+    if price_ticks <= 0:
+        raise RuntimeError(f"Delta returned an invalid passive quote for {symbol} {side}")
+    return format(price_ticks * tick, "f")
 
 
 def get_strategy_open_orders(product_id: int) -> list[dict[str, Any]]:
@@ -418,6 +431,7 @@ def reprice_post_only_order(product_id: int, symbol: str, order: dict[str, Any])
     side = str(order.get("side", ""))
     order_id = order.get("id")
     price = get_best_quote(symbol, side)
+    tick = get_product_tick_size(symbol)
     old_price = order.get("limit_price")
     try:
         if old_price is not None and float(old_price) == float(price):
@@ -426,17 +440,27 @@ def reprice_post_only_order(product_id: int, symbol: str, order: dict[str, Any])
     except (TypeError, ValueError):
         if str(old_price) == str(price):
             return
-    payload = {
-        "id": order_id,
-        "product_id": product_id,
-        "limit_price": price,
-        "size": int(order.get("size", order.get("unfilled_size", 0))),
-        "post_only": True,
-    }
-    data = signed_request("PUT", "/v2/orders", body_obj=payload)
-    result = data.get("result", data)
-    log.info("Repriced post-only order id=%s %s %s from %s to %s state=%s",
-             order_id, symbol, side, old_price, price, result.get("state"))
+    price_decimal = Decimal(price)
+    for attempt in range(4):
+        payload = {
+            "id": order_id,
+            "product_id": product_id,
+            "limit_price": format(price_decimal, "f"),
+            "size": int(order.get("size", order.get("unfilled_size", 0))),
+            "post_only": True,
+        }
+        try:
+            data = signed_request("PUT", "/v2/orders", body_obj=payload)
+            result = data.get("result", data)
+            log.info("Repriced post-only order id=%s %s %s from %s to %s state=%s",
+                     order_id, symbol, side, old_price, price_decimal, result.get("state"))
+            return
+        except RuntimeError as exc:
+            if "immediate_execution_post_only" not in str(exc) or attempt == 3:
+                raise
+            # The book can move between the quote and edit requests. Back off
+            # another tick and retry so the order remains maker-only.
+            price_decimal += -tick if side == "buy" else tick
 
 
 def manage_pending_maker_order(
@@ -651,9 +675,10 @@ def reconcile_position(
         str(order.get("id") or order.get("client_order_id") or "")
         for order in existing_orders
     }
-    for order_key in list(ORDER_REPRICE_ATTEMPTS):
-        if order_key not in active_order_keys:
-            ORDER_REPRICE_ATTEMPTS.pop(order_key, None)
+    previous_order_keys = ORDER_KEYS_BY_SYMBOL.get(contract.symbol, set())
+    for order_key in previous_order_keys - active_order_keys:
+        ORDER_REPRICE_ATTEMPTS.pop(order_key, None)
+    ORDER_KEYS_BY_SYMBOL[contract.symbol] = active_order_keys
     current_sign = 0 if current == 0 else (1 if current > 0 else -1)
 
     if current_sign and current_sign != desired_sign:
@@ -797,39 +822,40 @@ def main() -> None:
                 wait_or_stop(startup_delay)
                 startup_delay = min(startup_delay * 2, 60)
 
-        while not STOP_REQUESTED:
-            for contract in contracts:
-                if time.monotonic() < retry_after.get(contract.symbol, 0):
-                    continue
-                try:
-                    candles = add_supertrend(get_mark_candles(contract.symbol))
-                    latest = candles.iloc[-1]
-                    candle_time = int(latest["time"])
-                    # Reconcile each poll so maker-order fills and open orders are
-                    # tracked; only emit the candle summary once per completed bar.
-                    reconcile_position(contract, product_ids[contract.symbol],
-                                       int(latest["direction"]), float(latest["supertrend"]), candle_time)
-                    had_error = contract.symbol in retry_delay
-                    retry_delay.pop(contract.symbol, None)
-                    retry_after.pop(contract.symbol, None)
-                    if had_error:
-                        report_status("OK", f"Recovered; monitoring {contract.symbol}")
-                    if last_processed.get(contract.symbol) != candle_time:
-                        last_processed[contract.symbol] = candle_time
-                        log.info("%s close=%s supertrend=%s -> %s", contract.symbol,
-                                 latest["close"], latest["supertrend"],
-                                 "LONG (green)" if int(latest["direction"]) == 1 else "SHORT (red)")
-                except KeyboardInterrupt:
-                    STOP_REQUESTED = True
-                    break
-                except Exception as exc:
-                    log.exception("Problem processing %s", contract.symbol)
-                    delay = min(retry_delay.get(contract.symbol, 1) * 2, 60)
-                    retry_delay[contract.symbol] = delay
-                    retry_after[contract.symbol] = time.monotonic() + delay
-                    report_status("RETRYING", f"{contract.symbol}: {exc}")
-                    log.warning("Keeping strategy process running; retrying %s in %d seconds", contract.symbol, delay)
-            time.sleep(POLL_SECONDS)
+        def process_contract(contract: Contract) -> None:
+            if time.monotonic() < retry_after.get(contract.symbol, 0):
+                return
+            try:
+                candles = add_supertrend(get_mark_candles(contract.symbol))
+                latest = candles.iloc[-1]
+                candle_time = int(latest["time"])
+                # Reconcile each poll so maker orders are checked on a short
+                # cadence; only emit the candle summary once per completed bar.
+                reconcile_position(contract, product_ids[contract.symbol],
+                                   int(latest["direction"]), float(latest["supertrend"]), candle_time)
+                had_error = contract.symbol in retry_delay
+                retry_delay.pop(contract.symbol, None)
+                retry_after.pop(contract.symbol, None)
+                if had_error:
+                    report_status("OK", f"Recovered; monitoring {contract.symbol}")
+                if last_processed.get(contract.symbol) != candle_time:
+                    last_processed[contract.symbol] = candle_time
+                    log.info("%s close=%s supertrend=%s -> %s", contract.symbol,
+                             latest["close"], latest["supertrend"],
+                             "LONG (green)" if int(latest["direction"]) == 1 else "SHORT (red)")
+            except Exception as exc:
+                log.exception("Problem processing %s", contract.symbol)
+                delay = min(retry_delay.get(contract.symbol, 1) * 2, 60)
+                retry_delay[contract.symbol] = delay
+                retry_after[contract.symbol] = time.monotonic() + delay
+                report_status("RETRYING", f"{contract.symbol}: {exc}")
+                log.warning("Keeping strategy process running; retrying %s in %d seconds", contract.symbol, delay)
+
+        with ThreadPoolExecutor(max_workers=min(6, len(contracts))) as pool:
+            while not STOP_REQUESTED:
+                cycle_started = time.monotonic()
+                list(pool.map(process_contract, contracts))
+                wait_or_stop(max(0, POLL_SECONDS - (time.monotonic() - cycle_started)))
     finally:
         if LIVE_TRADING:
             def cancel_contract_orders(contract: Contract) -> None:
