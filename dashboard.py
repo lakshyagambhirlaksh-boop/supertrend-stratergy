@@ -177,7 +177,7 @@ PAGE = r'''<!doctype html>
           <label id="lotsField" class="label">Lots for each selected segment<br><input id="lotsPerSegment" type="number" min="1" max="10000" step="1" value="1"></label>
         </div>
         <button id="submitLots" onclick="submitLotSize()">Submit lot size</button>
-        <p id="lotSummary" class="note">Each selected segment: 1 lot. This setting applies when you next start the strategy.</p>
+        <p id="lotSummary" class="note">Each selected segment: 1 lot. Saved lot size applies on the next start and does not change open positions.</p>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
@@ -204,7 +204,6 @@ PAGE = r'''<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let refreshing = false;
-let dashboardRunning = false;
 let lotSizeDirty = false;
 let submittingLotSize = false;
 async function refresh() {
@@ -212,7 +211,6 @@ async function refresh() {
   refreshing = true;
   try {
     const r = await fetch('/api/status'); const d = await r.json();
-    dashboardRunning = Boolean(d.running);
     const healthSuffix = d.bot_health === 'RETRYING' ? ' · RETRYING' : d.bot_health === 'RESTARTING' ? ' · RESTARTING' : d.bot_health === 'STOPPING' ? ' · STOPPING' : ` · ${d.timeframe}`;
     $('status').textContent = d.running ? `RUNNING${healthSuffix}` : 'STOPPED';
     $('status').className = `state ${d.running ? 'on' : 'off'}`;
@@ -227,9 +225,9 @@ async function refresh() {
     $('timeframe').disabled = d.running;
     document.querySelectorAll('.segment-check').forEach(el => el.disabled = d.running);
     $('selectAllSegments').disabled = d.running;
-    $('lotsPerSegment').disabled = d.running;
-    $('submitLots').disabled = d.running || submittingLotSize;
-    if (!d.running && !lotSizeDirty && !submittingLotSize) $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
+    $('lotsPerSegment').disabled = false;
+    $('submitLots').disabled = submittingLotSize;
+    if (!lotSizeDirty && !submittingLotSize) $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
     if (d.timeframe) $('timeframe').value = d.timeframe;
     if (d.segment) {
       const active = d.segment.split(',');
@@ -292,23 +290,31 @@ function updateLotSummary(message) {
 async function submitLotSize() {
   const symbols = selectedSymbols();
   const lots = Number($('lotsPerSegment').value);
-  if (dashboardRunning) { alert('Stop the strategy before submitting a new lot size. It will apply the next time you start.'); return; }
-  if (!symbols.length) { alert('Select at least one trading segment.'); return; }
-  if (!Number.isInteger(lots) || lots < 1 || lots > 10000) { alert('Lots must be a whole number from 1 to 10000.'); return; }
+  if (!Number.isInteger(lots) || lots < 1 || lots > 10000) {
+    $('lotSummary').className = 'note error';
+    updateLotSummary('Enter a whole-number lot size from 1 to 10000.');
+    return;
+  }
   submittingLotSize = true;
+  $('lotSummary').className = 'note';
   $('submitLots').disabled = true;
   try {
-    const r = await fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeframe:$('timeframe').value,segment:symbols.join(','),lots_per_segment:lots})});
+    const r = await fetch('/api/lot-size', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lots_per_segment:lots})});
     const d = await r.json();
-    if (!r.ok) { alert(d.error || 'Could not save lot size.'); return; }
+    if (!r.ok) {
+      $('lotSummary').className = 'note error';
+      updateLotSummary(d.error || 'Could not save lot size.');
+      return;
+    }
     lotSizeDirty = false;
-    $('lotsPerSegment').value = d.sizes.LOTS_PER_SEGMENT;
-    updateLotSummary(`Saved: ${lots} lot${lots === 1 ? '' : 's'} for each of ${symbols.length} selected segment${symbols.length === 1 ? '' : 's'}. This applies when you next start the strategy.`);
+    $('lotsPerSegment').value = d.lots_per_segment;
+    updateLotSummary(`Saved: ${lots} lot${lots === 1 ? '' : 's'} per selected segment. Applies on the next start; current positions and the running bot are unchanged.`);
   } catch (e) {
-    alert('Could not reach the dashboard to save the lot size.');
+    $('lotSummary').className = 'note error';
+    updateLotSummary('Could not reach the dashboard to save the lot size.');
   } finally {
     submittingLotSize = false;
-    $('submitLots').disabled = dashboardRunning;
+    $('submitLots').disabled = false;
   }
 }
 async function startBot() {
@@ -1006,6 +1012,41 @@ def start():
             strategy_environment = None
             return jsonify(error=f"Could not launch strategy: {exc}"), 500
     return jsonify(ok=True, timeframe=timeframe)
+
+
+@app.post("/api/lot-size")
+def set_lot_size():
+    """Save a shared lot size for the next start without altering the live bot."""
+    global selected_sizes
+    body = request.get_json(silent=True) or {}
+    try:
+        lots = int(body.get("lots_per_segment", selected_sizes["LOTS_PER_SEGMENT"]))
+    except (TypeError, ValueError):
+        return jsonify(error="Lot size must be a whole number."), 400
+    if not (1 <= lots <= 10000):
+        return jsonify(error="Lot size must be from 1 to 10000."), 400
+
+    with state_lock:
+        selected_sizes = {
+            "ETH_SIZE": lots,
+            "SOL_SIZE": lots,
+            "BNB_SIZE": lots,
+            "SNDKB_SIZE": lots,
+            "SOXLB_SIZE": lots,
+            "MVLL_SIZE": lots,
+            "LOTS_PER_SEGMENT": lots,
+        }
+        sizes_to_return = selected_sizes.copy()
+        persist_settings({
+            "ETH_SIZE": str(lots),
+            "SOL_SIZE": str(lots),
+            "BNB_SIZE": str(lots),
+            "SNDKB_SIZE": str(lots),
+            "SOXLB_SIZE": str(lots),
+            "MVLL_SIZE": str(lots),
+            "LOTS_PER_SEGMENT": str(lots),
+        })
+    return jsonify(ok=True, lots_per_segment=lots, sizes=sizes_to_return, applies_next_start=True)
 
 
 @app.post("/api/stop")
