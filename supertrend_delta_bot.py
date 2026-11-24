@@ -658,6 +658,18 @@ def reconcile_emergency_stop(
     if matching_stop:
         old_price = Decimal(str(matching_stop.get("stop_price", target)))
         old_size = int(matching_stop.get("size", 0))
+        old_stop_crossed = old_price >= mark_price if position > 0 else old_price <= mark_price
+        if old_stop_crossed:
+            # Replace stale stops from an earlier run that are already on the
+            # wrong side of the mark. Do not convert that condition into a
+            # bot-issued market close.
+            cancel_emergency_stop(product_id, matching_stop)
+            EMERGENCY_STATE["orders"].pop(symbol, None)
+            save_emergency_state()
+            matching_stop = None
+    if matching_stop:
+        old_price = Decimal(str(matching_stop.get("stop_price", target)))
+        old_size = int(matching_stop.get("size", 0))
         tighter = target > old_price if position > 0 else target < old_price
         if tighter or old_size != abs(position):
             payload = {
