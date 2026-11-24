@@ -44,7 +44,7 @@ CANDLE_LIMIT = 500
 POLL_SECONDS = 2
 MAKER_TIMEOUT_SECONDS = 12
 MAKER_REPRICE_SECONDS = (2, 4, 6, 8, 10)
-SUPERTREND_STOP_OFFSET = Decimal("0.006")
+SUPERTREND_STOP_OFFSET = Decimal("0.005")
 STOP_ORDER_DELAY_SECONDS = 10
 PRODUCT_TICK_SIZES: dict[str, Decimal] = {}
 STOP_REQUESTED = False
@@ -292,7 +292,7 @@ def cancel_order(product_id: int, order: dict[str, Any]) -> None:
 
 
 def supertrend_stop_price(symbol: str, direction: int, supertrend: float) -> str:
-    """Place the stop 0.6% beyond the SuperTrend, rounded away from the market."""
+    """Place the stop 0.5% beyond the SuperTrend, rounded away from the market."""
     tick = get_product_tick_size(symbol)
     level = Decimal(str(supertrend))
     raw_price = level * (Decimal("1") - SUPERTREND_STOP_OFFSET
@@ -320,7 +320,7 @@ def place_supertrend_stop(
     }
     data = signed_request("POST", "/v2/orders", body_obj=payload)
     result = data.get("result", data)
-    log.warning("Placed separate reduce-only SuperTrend stop id=%s %s %s lots=%d at %s (0.6%% offset)",
+    log.warning("Placed separate reduce-only SuperTrend stop id=%s %s %s lots=%d at %s (0.5%% offset)",
                 result.get("id"), contract.symbol, side, abs(position), stop_price)
     return str(result["id"]) if result.get("id") is not None else None
 
