@@ -12,6 +12,8 @@ Set one shared `LOTS_PER_SEGMENT` value. That many contract lots are used for ev
 
 Orders start as post-only limit orders. The bot checks pending orders every 2 seconds and reprices them at 2, 4, 6, 8, and 10 seconds. At 12 seconds, an unfilled remainder may fall back to a market order and incur taker fees. A reversal submits the reduce-only close and new-side entry orders in the same reconciliation cycle. Stopping the bot cancels its pending orders and leaves positions open.
 
+For each live position, the bot maintains a Delta-hosted reduce-only stop-market order triggered by mark price. The emergency stop is placed 0.6% inside the current SuperTrend line (above the line for longs, below it for shorts) and only tightens as the line moves. If the threshold is already crossed when checked, the bot cancels pending bot orders and closes that position at market. After an emergency stop fills, that segment will not re-enter in the same SuperTrend direction; it waits for a direction change. The stop remains on Delta if the bot is stopped, while the position remains open. Stop-market execution can slip during fast moves.
+
 ## Setup
 
 Copy `.env.example` to `.env`, then enter your Delta API credentials. Keep `.env` private and do not commit it. `ENABLE_LIVE_TRADING` defaults to `false`; set it to `true` only when you intend to place live orders.
@@ -27,7 +29,7 @@ python .\dashboard.py
 
 Open `http://127.0.0.1:8765`. The dashboard is bound to localhost by default. For VPS access, use an SSH tunnel rather than exposing the unauthenticated control page publicly.
 
-The dashboard saves timeframe, segment selection, and shared lot size into `.env`. It retries temporary bot errors, but trading pauses while the exchange or API is unavailable. The bot does not set an exchange stop-loss or take-profit.
+The dashboard saves timeframe, segment selection, and shared lot size into `.env`. It retries temporary bot errors, but trading pauses while the exchange or API is unavailable. The dashboard shows the active exchange stop under **Exchange SL**.
 
 ## Streamlit Cloud
 

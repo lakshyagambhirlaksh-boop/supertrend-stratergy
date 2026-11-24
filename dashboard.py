@@ -181,7 +181,7 @@ PAGE = r'''<!doctype html>
         <button id="start" class="start" onclick="startBot()">Start live strategy</button>
         <button id="stop" class="stop" onclick="stopBot()">Stop strategy</button>
       </div>
-      <p class="note">On errors, the strategy stays running and retries; it pauses order placement while recovering. Stop cancels pending bot orders and leaves open positions as they are.</p>
+      <p class="note">The bot maintains an exchange-side reduce-only emergency stop 0.6% inside the SuperTrend line, triggered by mark price. A filled emergency stop pauses that segment until SuperTrend changes. Stop cancels pending entry orders and leaves open positions and their exchange stops in place.</p>
     </section>
     <section class="card positions-card">
       <div class="label">Current Delta positions and mark prices</div>
