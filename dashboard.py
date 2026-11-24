@@ -80,6 +80,9 @@ trade_activity_lock = threading.Lock()
 trade_activity_cache: dict[str, Any] = {"checked_at": 0.0, "rows": [], "error": None}
 TRADE_ACTIVITY_CACHE_SECONDS = 10
 TRADE_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+inr_balance_lock = threading.Lock()
+inr_balance_cache: dict[str, Any] = {"checked_at": 0.0, "value": None, "error": None}
+INR_BALANCE_CACHE_SECONDS = 10
 
 
 def get_dashboard_product_ids(symbols: tuple[str, ...]) -> dict[str, int]:
@@ -184,6 +187,7 @@ PAGE = r'''<!doctype html>
     <section class="card connection-card">
       <div class="connection-grid">
         <div><div class="label">Public IP address used for Delta</div><div id="publicIp" class="connection-value">Checking…</div></div>
+        <div><div class="label">Delta account balance (INR)</div><div id="accountBalance" class="connection-value">Loadingâ€¦</div></div>
       </div>
       <p class="note">If your Delta API key has an IP whitelist, add this public IP address there.</p>
     </section>
@@ -239,6 +243,13 @@ async function refresh() {
     $('apiConnection').className = `connection-value ${d.positions_error ? 'error' : 'on'}`;
     $('publicIp').textContent = d.public_ip || 'Unavailable';
     $('publicIp').className = `connection-value ${d.public_ip ? '' : 'error'}`;
+    const inrBalance = Number(d.inr_balance);
+    const hasInrBalance = d.inr_balance !== null && d.inr_balance !== undefined && Number.isFinite(inrBalance);
+    $('accountBalance').textContent = hasInrBalance
+      ? new Intl.NumberFormat('en-IN', {style:'currency', currency:'INR', minimumFractionDigits:2, maximumFractionDigits:2}).format(inrBalance)
+      : 'Unavailable';
+    $('accountBalance').className = `connection-value ${hasInrBalance ? '' : 'error'}`;
+    $('accountBalance').title = d.balance_error || 'Total INR wallet balance from Delta.';
     const tradeRows = d.trade_activity || [];
     if (d.trade_activity_error) {
       $('tradeActivity').innerHTML = `<p class="error">Could not read Delta fills: ${escapeHtml(d.trade_activity_error)}</p>`;
@@ -605,6 +616,29 @@ def get_public_ip() -> tuple[str | None, str | None]:
         return ip_cache["address"], ip_cache["error"]
 
 
+def get_inr_account_balance() -> tuple[str | None, str | None]:
+    """Read and briefly cache the total INR wallet balance from Delta."""
+    now = time.monotonic()
+    with inr_balance_lock:
+        if now - inr_balance_cache["checked_at"] < INR_BALANCE_CACHE_SECONDS:
+            return inr_balance_cache["value"], inr_balance_cache["error"]
+    try:
+        payload = signed_request("GET", "/v2/wallet/balances")
+        wallet = next(
+            (item for item in payload.get("result", [])
+             if str(item.get("asset_symbol", "")).upper() == "INR"),
+            None,
+        )
+        if wallet is None or wallet.get("balance") in (None, ""):
+            raise RuntimeError("Delta did not return an INR wallet balance.")
+        value, error = str(wallet["balance"]), None
+    except Exception as exc:
+        value, error = None, str(exc)
+    with inr_balance_lock:
+        inr_balance_cache.update(checked_at=time.monotonic(), value=value, error=error)
+    return value, error
+
+
 def get_mark_price(symbol: str) -> str | None:
     response = requests.get(f"{API_BASE}/v2/tickers/{symbol}", timeout=5)
     response.raise_for_status()
@@ -729,6 +763,11 @@ def build_status_snapshot() -> dict[str, Any]:
         positions_error = "Add Delta API credentials to .env to show positions."
         trade_activity_error = positions_error
 
+    if API_KEY and API_SECRET:
+        inr_balance, balance_error = get_inr_account_balance()
+    else:
+        inr_balance, balance_error = None, "Add Delta API credentials to .env to read the account balance."
+
     delta_client_ip = None
     if positions_error:
         match = re.search(r"client_ip['\"]?\s*:\s*['\"]([^'\" ]+)", positions_error)
@@ -752,6 +791,8 @@ def build_status_snapshot() -> dict[str, Any]:
         "positions_error": positions_error,
         "public_ip": public_ip,
         "public_ip_error": public_ip_error,
+        "inr_balance": inr_balance,
+        "balance_error": balance_error,
         "trade_activity": trade_activity,
         "trade_activity_error": trade_activity_error,
         "last_error": last_error,
@@ -788,6 +829,8 @@ def status():
             "positions_error": "Loading live data from Delta…",
             "public_ip": None,
             "public_ip_error": None,
+            "inr_balance": None,
+            "balance_error": "Loading INR account balance from Delta…" if API_KEY and API_SECRET else "Add Delta API credentials to .env to read the account balance.",
             "trade_activity": [],
             "trade_activity_error": "Loading recent fills from Delta…" if API_KEY and API_SECRET else "Add Delta API credentials to .env to show positions.",
             "last_error": last_error,
