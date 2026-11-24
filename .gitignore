@@ -5,8 +5,6 @@ __pycache__/
 *.py[cod]
 strategy.log
 dashboard.log
-.supertrend_emergency_state.json
-.supertrend_emergency_state.json.tmp
 *.pid
 .venv/
 venv/

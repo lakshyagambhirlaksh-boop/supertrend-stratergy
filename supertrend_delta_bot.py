@@ -12,7 +12,6 @@ import hmac
 import json
 import logging
 import os
-from pathlib import Path
 import signal
 import sys
 import time
@@ -45,12 +44,9 @@ CANDLE_LIMIT = 500
 POLL_SECONDS = 2
 MAKER_TIMEOUT_SECONDS = 12
 MAKER_REPRICE_SECONDS = (2, 4, 6, 8, 10)
-EMERGENCY_STOP_OFFSET = Decimal("0.006")
-BOT_STATE_PATH = Path(__file__).with_name(".supertrend_emergency_state.json")
 PRODUCT_TICK_SIZES: dict[str, Decimal] = {}
 STOP_REQUESTED = False
 ORDER_REPRICE_ATTEMPTS: dict[str, int] = {}
-EMERGENCY_STATE: dict[str, dict[str, Any]] = {"orders": {}, "paused": {}}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -271,96 +267,6 @@ def get_strategy_open_orders(product_id: int) -> list[dict[str, Any]]:
     return [order for order in orders if str(order.get("client_order_id", "")).startswith("stbot-")]
 
 
-def get_bot_open_orders(product_id: int) -> list[dict[str, Any]]:
-    if not LIVE_TRADING:
-        return []
-    data = signed_request("GET", "/v2/orders", {"product_ids": product_id, "states": "open,pending"})
-    return [
-        order for order in data.get("result", [])
-        if str(order.get("client_order_id", "")).startswith(("stbot-", "ststop-"))
-    ]
-
-
-def load_emergency_state() -> None:
-    global EMERGENCY_STATE
-    try:
-        data = json.loads(BOT_STATE_PATH.read_text(encoding="utf-8"))
-        EMERGENCY_STATE = {
-            "orders": data.get("orders", {}) if isinstance(data.get("orders"), dict) else {},
-            "paused": data.get("paused", {}) if isinstance(data.get("paused"), dict) else {},
-        }
-    except FileNotFoundError:
-        EMERGENCY_STATE = {"orders": {}, "paused": {}}
-    except Exception:
-        log.exception("Could not read emergency stop state; starting with empty local state")
-        EMERGENCY_STATE = {"orders": {}, "paused": {}}
-
-
-def save_emergency_state() -> None:
-    temporary_path = BOT_STATE_PATH.with_suffix(BOT_STATE_PATH.suffix + ".tmp")
-    temporary_path.write_text(json.dumps(EMERGENCY_STATE, separators=(",", ":")), encoding="utf-8")
-    os.replace(temporary_path, BOT_STATE_PATH)
-
-
-def get_order_by_client_id(client_order_id: str) -> dict[str, Any]:
-    data = signed_request("GET", f"/v2/orders/client_order_id/{client_order_id}")
-    return data.get("result") or {}
-
-
-def cancel_emergency_stop(product_id: int, order: dict[str, Any]) -> None:
-    if not LIVE_TRADING:
-        return
-    signed_request("DELETE", "/v2/orders", body_obj={"id": order["id"], "product_id": product_id})
-    log.info("Cancelled emergency stop %s for %s", order.get("id"), order.get("product_symbol"))
-
-
-def get_mark_price_decimal(symbol: str) -> Decimal:
-    response = SESSION.get(f"{API_BASE}/v2/tickers/{symbol}", timeout=10)
-    data = _check_response(response)
-    mark_price = (data.get("result") or {}).get("mark_price")
-    if mark_price in (None, ""):
-        raise RuntimeError(f"Delta did not return a mark price for {symbol}")
-    return Decimal(str(mark_price))
-
-
-def emergency_stop_price(symbol: str, position: int, supertrend: Any) -> Decimal:
-    tick_size = get_product_tick_size(symbol)
-    line = Decimal(str(supertrend))
-    # The requested tighter stop sits above the green line for longs and below
-    # the red line for shorts. If that threshold is already past the live mark,
-    # reconcile_emergency_stop re-anchors a valid stop without market-closing.
-    factor = Decimal("1") + EMERGENCY_STOP_OFFSET if position > 0 else Decimal("1") - EMERGENCY_STOP_OFFSET
-    raw_price = line * factor
-    rounding = ROUND_CEILING if position > 0 else ROUND_FLOOR
-    return (raw_price / tick_size).to_integral_value(rounding=rounding) * tick_size
-
-
-def place_emergency_stop(contract: Contract, product_id: int, position: int, stop_price: Decimal) -> dict[str, Any]:
-    side = "sell" if position > 0 else "buy"
-    client_order_id = f"ststop-{contract.symbol}-{int(time.time())}-{uuid.uuid4().hex[:5]}"
-    payload = {
-        "product_symbol": contract.symbol,
-        "size": abs(position),
-        "side": side,
-        "order_type": "market_order",
-        "stop_order_type": "stop_loss_order",
-        "stop_price": format(stop_price, "f"),
-        "stop_trigger_method": "mark_price",
-        "reduce_only": True,
-        "client_order_id": client_order_id,
-    }
-    data = signed_request("POST", "/v2/orders", body_obj=payload)
-    order = data.get("result", data)
-    EMERGENCY_STATE["orders"][contract.symbol] = {
-        "client_order_id": client_order_id,
-        "direction": 1 if position > 0 else -1,
-    }
-    save_emergency_state()
-    log.warning("Delta accepted exchange emergency stop id=%s %s %s lots=%d at %s (SuperTrend offset 0.6%%)",
-                order.get("id"), contract.symbol, side, abs(position), stop_price)
-    return order
-
-
 def cancel_order(product_id: int, order: dict[str, Any]) -> None:
     if not LIVE_TRADING:
         return
@@ -570,128 +476,7 @@ def market_fallback_for_reversal(
         place_market_order(contract.symbol, remaining_lots, open_side)
 
 
-def reconcile_emergency_stop(
-    contract: Contract,
-    product_id: int,
-    position: int,
-    direction: int,
-    supertrend: Any,
-    bot_orders: list[dict[str, Any]],
-) -> bool:
-    """Keep a Delta-hosted 0.6% SuperTrend emergency stop current; return True when entry must pause."""
-    if not LIVE_TRADING:
-        return False
-
-    symbol = contract.symbol
-    state_order = EMERGENCY_STATE["orders"].get(symbol)
-    paused_direction = EMERGENCY_STATE["paused"].get(symbol)
-    active_stops = [
-        order for order in bot_orders
-        if str(order.get("client_order_id", "")).startswith("ststop-")
-        and order.get("stop_order_type") == "stop_loss_order"
-    ]
-
-    if position == 0:
-        if state_order:
-            try:
-                closed_order = get_order_by_client_id(str(state_order["client_order_id"]))
-                if str(closed_order.get("state", "")).lower() == "closed":
-                    EMERGENCY_STATE["paused"][symbol] = int(state_order.get("direction", 0))
-                    log.warning("%s emergency stop filled; pausing re-entry until SuperTrend changes", symbol)
-                    log_trade_event(f"{symbol.removesuffix('USD')} emergency stop filled; entry paused until SuperTrend changes")
-            except Exception as exc:
-                # If Delta cannot confirm the old stop's final state, do not
-                # immediately reopen in the same direction after a flat read.
-                EMERGENCY_STATE["paused"][symbol] = int(state_order.get("direction", 0))
-                log.warning("Could not confirm %s emergency stop status; pausing same-direction re-entry: %s", symbol, exc)
-            EMERGENCY_STATE["orders"].pop(symbol, None)
-        for order in active_stops:
-            cancel_emergency_stop(product_id, order)
-        paused_direction = EMERGENCY_STATE["paused"].get(symbol)
-        if paused_direction is not None and int(paused_direction) == direction:
-            for order in bot_orders:
-                if str(order.get("client_order_id", "")).startswith("stbot-"):
-                    cancel_order(product_id, order)
-            save_emergency_state()
-            return True
-        if paused_direction is not None:
-            EMERGENCY_STATE["paused"].pop(symbol, None)
-        EMERGENCY_STATE["orders"].pop(symbol, None)
-        save_emergency_state()
-        return False
-
-    position_direction = 1 if position > 0 else -1
-    side = "sell" if position > 0 else "buy"
-    matching_stop = next((order for order in active_stops if order.get("side") == side), None)
-    for order in active_stops:
-        if order is not matching_stop:
-            cancel_emergency_stop(product_id, order)
-
-    if position_direction != direction:
-        if matching_stop:
-            EMERGENCY_STATE["orders"][symbol] = {
-                "client_order_id": matching_stop.get("client_order_id"),
-                "direction": position_direction,
-            }
-            save_emergency_state()
-        else:
-            log.warning("%s has no emergency stop while its position opposes the current SuperTrend; waiting for normal reversal exit", symbol)
-        return False
-
-    target = emergency_stop_price(symbol, position, supertrend)
-    mark_price = get_mark_price_decimal(symbol)
-    target_was_crossed = target >= mark_price if position > 0 else target <= mark_price
-    if target_was_crossed:
-        # Never market-close a position just because the bot has restarted or
-        # the SuperTrend line moved across the mark. Re-anchor a valid
-        # exchange-side backstop 0.6% beyond the current mark instead.
-        tick_size = get_product_tick_size(symbol)
-        fallback = mark_price * (
-            Decimal("1") - EMERGENCY_STOP_OFFSET if position > 0
-            else Decimal("1") + EMERGENCY_STOP_OFFSET
-        )
-        rounding = ROUND_FLOOR if position > 0 else ROUND_CEILING
-        target = (fallback / tick_size).to_integral_value(rounding=rounding) * tick_size
-        log.warning("%s SuperTrend stop was already past the mark; setting a valid 0.6%% backstop at %s (mark %s)",
-                    symbol, target, mark_price)
-
-    if matching_stop:
-        old_price = Decimal(str(matching_stop.get("stop_price", target)))
-        old_size = int(matching_stop.get("size", 0))
-        old_stop_crossed = old_price >= mark_price if position > 0 else old_price <= mark_price
-        if old_stop_crossed:
-            # Replace stale stops from an earlier run that are already on the
-            # wrong side of the mark. Do not convert that condition into a
-            # bot-issued market close.
-            cancel_emergency_stop(product_id, matching_stop)
-            EMERGENCY_STATE["orders"].pop(symbol, None)
-            save_emergency_state()
-            matching_stop = None
-    if matching_stop:
-        old_price = Decimal(str(matching_stop.get("stop_price", target)))
-        old_size = int(matching_stop.get("size", 0))
-        tighter = target > old_price if position > 0 else target < old_price
-        if tighter or old_size != abs(position):
-            payload = {
-                "id": matching_stop["id"],
-                "product_id": product_id,
-                "size": abs(position),
-                "stop_price": format(target if tighter else old_price, "f"),
-            }
-            signed_request("PUT", "/v2/orders", body_obj=payload)
-            log.info("Updated %s exchange emergency stop to %s for %d lots", symbol,
-                     payload["stop_price"], abs(position))
-        EMERGENCY_STATE["orders"][symbol] = {
-            "client_order_id": matching_stop.get("client_order_id"),
-            "direction": position_direction,
-        }
-        save_emergency_state()
-    else:
-        place_emergency_stop(contract, product_id, position, target)
-    return False
-
-
-def reconcile_position(contract: Contract, product_id: int, direction: int, supertrend: Any) -> None:
+def reconcile_position(contract: Contract, product_id: int, direction: int) -> None:
     """Reconcile positions; submit close/open limits together on a trend reversal."""
     desired_sign = 1 if direction == 1 else -1
     current = get_position(product_id) if LIVE_TRADING else PAPER_POSITIONS.get(contract.symbol, 0)
@@ -712,13 +497,7 @@ def reconcile_position(contract: Contract, product_id: int, direction: int, supe
             position_side = "long" if current > 0 else "short"
             log_trade_event(f"{instrument} {position_side} size changed to {abs(current)} lots while SuperTrend was {trend}")
         LAST_KNOWN_POSITIONS[contract.symbol] = current
-    bot_orders = get_bot_open_orders(product_id)
-    if reconcile_emergency_stop(contract, product_id, current, direction, supertrend, bot_orders):
-        return
-    existing_orders = [
-        order for order in bot_orders
-        if str(order.get("client_order_id", "")).startswith("stbot-")
-    ]
+    existing_orders = get_strategy_open_orders(product_id)
     active_order_keys = {
         str(order.get("id") or order.get("client_order_id") or "")
         for order in existing_orders
@@ -814,7 +593,6 @@ def reconcile_position(contract: Contract, product_id: int, direction: int, supe
 def main() -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = False
-    load_emergency_state()
     contracts: list[Contract] = []
     product_ids: dict[str, int] = {}
     last_processed: dict[str, int] = {}
@@ -880,12 +658,7 @@ def main() -> None:
                     candle_time = int(latest["time"])
                     # Reconcile each poll so maker-order fills and open orders are
                     # tracked; only emit the candle summary once per completed bar.
-                    reconcile_position(
-                        contract,
-                        product_ids[contract.symbol],
-                        int(latest["direction"]),
-                        latest["supertrend"],
-                    )
+                    reconcile_position(contract, product_ids[contract.symbol], int(latest["direction"]))
                     had_error = contract.symbol in retry_delay
                     retry_delay.pop(contract.symbol, None)
                     retry_after.pop(contract.symbol, None)
